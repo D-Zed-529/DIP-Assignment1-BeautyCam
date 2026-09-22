@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from ..context import FrameContext
+from ..mls import identity_maps, mls_similarity_maps
 from ..pipeline import Effect, NEED_FACES
 from ..infer import FACE_OVAL_IDS
 
@@ -26,8 +27,7 @@ SMOOTH_DIAMETER = 9        #双边滤波邻域直径（一期口径）
 SMOOTH_SIGMA = 60          #双边滤波颜色/空间 sigma（一期口径）
 WHITEN_L_MAX = 30.0        # 美白滑杆上限（LAB L 增量；一期 15~18 推荐档）
 SLIM_MAX_SHIFT_RATIO = 0.055   # 瘦脸强度=1.0 时的最大水平位移（占帧宽比例）
-SLIM_INSIDE_SIGMA = 58.0   # 轮廓内侧（脸颊）衰减尺度：宽拖拽，脸颊整体内收
-SLIM_OUTSIDE_SIGMA = 22.0   # 轮廓外侧（背景/耳）衰减尺度：窄滑动，仅轮廓边内移
+SLIM_PROTECT_FADE_PX = 32.0     # 上半脸保护窗衰减带宽度（px）：眉线以上场→0
 EYE_RADIUS_RATIO = 0.045   # 大眼作用半径（占帧宽比例，作半径上限兜底）
 EYE_RADIUS_FROM_CORNERS = 0.85   # 大眼半径 = 眼角距 × 系数（自适应透视缩短）
 EYE_MIN_CORNER_RATIO = 0.02      # 眼角距（归一化）低于此值视为透视塌缩，跳过该眼
@@ -178,22 +178,20 @@ def enlarge_eyes(frame_bgr: np.ndarray, landmarks: np.ndarray,
 def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
               strength: float = 0.40,
               yaw_deg: float | None = None) -> np.ndarray:
-    """瘦脸：下颌两侧向脸中心收缩（liquify，remap 实现，内外不对称场）。
+    """瘦脸 v4：MLS 刚体变形（Schaefer 2006），关键点驱动。
 
-    位移场设计（实机反馈"效果非常不明显"后的第二版）：
-      - 方向：采样坐标取"更靠脸外侧"的像素 => 内容向中心移动（内收）；
-      - 轮廓**内侧**（脸颊）用宽衰减（σ≈58px）：脸颊整体被拖向中心，
-        而非只有贴着下颌线的一条窄管在动；
-      - 轮廓**外侧**（背景/耳）用窄衰减（σ≈22px）：只有轮廓边滑动内移，
-        背景大面积不受牵连；
-      - 幅度上限 0.055×帧宽（1280 下强度 1.0 ≈ 70px，默认 0.4 ≈ 28px）。
+    v2/v3 的手调高斯位移场是对 MLS 的粗糙近似：方向硬编码水平、σ 靠
+    拍脑袋。v4 直接实现教科书算法（core/mls.py，复数形式 + 粗网格加速）：
+      - 动点：下颌链关键点，沿"指向脸中心"方向内移（跟随轮廓法向，
+        不再只是水平方向）；
+      - 锚点：眼角/眉/鼻尖/额顶/嘴角/下巴（P==Q），MLS 自动保证这些
+        区域稳住——替代 v3 的竖直渐变窗与远端衰减等全部手工机制；
+      - 位移沿链渐变（下巴端小、下颌角端弱、中段最大），幅度上限
+        0.055×帧宽（1280 下默认强度 0.4 ≈ 28px）。
 
-    侧脸防伪影：
+    侧脸防伪影（沿用）：
       - 头姿门控：|yaw| ≤20° 全强度，20°~40° 线性衰减，≥40° 关闭；
-      - |yaw| > 15° 时跳过"远端"下颌链——头转过去后远端链在 2D 投影上
-        塌缩进脸颊中部（不再是真的轮廓），沿它液化会横穿脸面拉出伪影。
-        远端判定不看 yaw 符号（免受镜像/左右习惯干扰），直接比较两条链
-        的 2D 质心谁离鼻尖更近。
+      - |yaw| > 15° 时跳过"远端"下颌链（2D 质心更近鼻尖的塌缩侧）。
     """
     if strength <= 0:
         return frame_bgr
@@ -203,6 +201,28 @@ def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
     if strength <= 0:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
+    map_x, map_y = slim_face_maps(w, h, landmarks, strength=strength,
+                                  yaw_deg=yaw_deg)
+    return cv2.remap(frame_bgr, map_x, map_y,
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+def slim_face_maps(w: int, h: int, landmarks: np.ndarray,
+                   strength: float = 0.40,
+                   yaw_deg: float | None = None
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """瘦脸 v4 的位移场（slim_face 的纯函数核，供测试直接断言场量）。
+
+    返回 (map_x, map_y)：眼线以上被锚点钉住（亚像素级），ROI 外严格
+    恒等（羽化保证），下颌区沿轮廓法向内收。
+    """
+    if strength <= 0:
+        return identity_maps(h, w)
+    if yaw_deg is None:
+        yaw_deg = estimate_yaw_deg(landmarks)
+    strength = strength * pose_gate(yaw_deg)
+    if strength <= 0:
+        return identity_maps(h, w)
     lm_px = landmarks[:, :2] * np.array([w, h], dtype=np.float32)
     nose_x = float(lm_px[1, 0])   # 鼻尖 x 作为脸中心参考
     max_shift = strength * SLIM_MAX_SHIFT_RATIO * w
@@ -212,57 +232,76 @@ def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
         chains.sort(key=lambda ids: abs(float(lm_px[ids, 0].mean()) - nose_x))
         chains = chains[1:]     # 跳过最靠近鼻尖的一条
 
-    margin = int(SLIM_INSIDE_SIGMA * 2.5)
-    all_pts = np.vstack([lm_px[c] for c in chains])
-    y0 = int(max(all_pts[:, 1].min() - margin, 0))
-    y1 = int(min(all_pts[:, 1].max() + margin, h))
-    x_lo = int(max(all_pts[:, 0].min() - margin, 0))
-    x_hi = int(min(all_pts[:, 0].max() + margin, w))
-    if x_hi - x_lo < 8 or y1 - y0 < 8:
-        return frame_bgr
+    # 脸中心参考：鼻尖与下巴中点上移一点（避开下巴尖的极值）
+    center = np.array([(float(lm_px[1, 0]) + float(lm_px[152, 0])) / 2,
+                       (float(lm_px[1, 1]) + float(lm_px[152, 1])) / 2])
 
-    # 脸轮廓内侧掩膜（内外不对称衰减用）
-    oval_full = np.zeros((h, w), np.uint8)
-    cv2.fillPoly(oval_full, [lm_px[FACE_OVAL_IDS].astype(np.int32)], 255)
-    inside = oval_full[y0:y1, x_lo:x_hi] > 0
-    sigma = np.where(inside, SLIM_INSIDE_SIGMA, SLIM_OUTSIDE_SIGMA)
+    # 动点门槛：下颌链上高于下眼睑线的点（颞/耳侧，如 454/93）转锚点。
+    # 这些点在真实人脸上贴着耳朵，内移会把耳朵区域拉歪。
+    eyeline_y = float(np.median(lm_px[[145, 374], 1]))
+    # 颞侧高度衰减：动点越接近眼线幅度越小（嘴线处全量、眼线处归零）。
+    # 没有这一档时眼线下方最近的动点幅度大、梯度陡，场会漏进额侧。
+    mouth_y = float(np.median(lm_px[[61, 291], 1]))
+    span = max(mouth_y - eyeline_y, 1e-3)
 
-    # 竖直渐变窗：眼线以下渐起、嘴线以下全量——链条顶端（耳侧）的带宽
-    # 不再上探太阳穴/发际线（实机"正脸效果不好"来源之一：鬓角头发被拖）
-    y_eye = max(float(lm_px[145, 1]), float(lm_px[374, 1]))   # 左/右下眼睑
-    y_mouth = float(lm_px[14, 1])                             # 下唇内侧点
-    v_span = max(y_mouth - y_eye, 1.0)
-    v_win = np.clip(
-        (np.arange(y0, y1, dtype=np.float32)[:, None] - y_eye) / v_span,
-        0.0, 1.0) * np.ones((x_hi - x_lo,), np.float32)[None, :]
+    movers_P, movers_Q = [], []
 
-    # ---- 两侧链的位移场合成为单一总场，只做一次 remap ----
-    # 位移场 = Σ 高斯衰减 × 外向单位向量 × 幅度，天然连续：
-    #   - 无需内容 alpha 混合（混合会产生"原位+位移"重影，观感位移减半
-    #     且发虚——实机"瘦脸不明显"的根因）；
-    #   - ROI 边界处位移已衰减到 ~0，无接缝。
-    xs = np.arange(x_lo, x_hi, dtype=np.float32)[None, :]
-    outward = np.sign(xs - nose_x)
-    shift_total = np.zeros((y1 - y0, x_hi - x_lo), np.float32)
+    def _pin(p_i):
+        movers_P.append(p_i)
+        movers_Q.append(p_i.copy())
+
     for side_ids in chains:
         pts = lm_px[side_ids]
-        # 到下颌链折线的最短距离场：ROI 内画 1px 链线 + 距离变换
-        # （不能用 LINE_AA：抗锯齿值 <255 让"补图"没有零像素，DT 失效）
-        line = np.zeros((y1 - y0, x_hi - x_lo), np.uint8)
-        cv2.polylines(line, [(pts - [x_lo, y0]).astype(np.int32)], False, 255, 1)
-        line = cv2.threshold(line, 127, 255, cv2.THRESH_BINARY)[1]
-        dist = cv2.distanceTransform(255 - line, cv2.DIST_L2, 3)
-        wb = np.exp(-(dist / sigma) ** 2).astype(np.float32)
-        shift_total += outward * (max_shift * wb * v_win)
+        for p_i in pts[pts[:, 1] < eyeline_y]:
+            _pin(p_i)
+        moving = pts[pts[:, 1] >= eyeline_y]
+        n = len(moving)
+        if n == 0:
+            continue
+        # 沿链位置渐变：下巴端(t=0) 0.4 → 中段(t=0.5) 1.0 → 耳端(t=1) 0.4
+        t = np.linspace(0.0, 1.0, n)
+        taper = 0.4 + 2.4 * t * (1.0 - t)   # 抛物线，峰=1.0
+        # 高度因子（smoothstep）：动点 y 从嘴线升到眼线，幅度 1 → 0
+        hf = np.clip((moving[:, 1] - eyeline_y) / span, 0.0, 1.0)
+        hfac = hf * hf * (3.0 - 2.0 * hf)
+        for p_i, tp, h_i in zip(moving, taper, hfac):
+            direction = center - p_i
+            norm = float(np.hypot(*direction))
+            if norm < 1e-3 or h_i <= 0.0:
+                _pin(p_i)   # 高度因子归零的点直接锚住，控制点更干净
+                continue
+            amount = max_shift * float(tp) * float(h_i)
+            movers_P.append(p_i)
+            movers_Q.append(p_i + direction / norm * amount)
 
-    # 从"更靠外侧"的位置采样 => 内容向脸中心移动（内收）
-    map_x = (xs + shift_total).astype(np.float32)
-    map_y = np.arange(y0, y1, dtype=np.float32)[:, None] * np.ones_like(map_x)
-    out = frame_bgr.copy()
-    out[y0:y1, x_lo:x_hi] = cv2.remap(
-        frame_bgr, map_x, map_y,
-        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    return out
+    # 锚点：眼角/眉/鼻尖/额顶/嘴角/下巴（不动，稳定身份区域）。
+    # 上轮廓弧（额侧/颞部）必须整圈钉住：MLS 是全局法，只锚额顶单点时
+    # 下颌动点的位移会沿平面向上漏到额头（实测 2~5px 漂移）。
+    anchor_ids = (33, 133, 362, 263,          # 眼角
+                  105, 334,                    # 眉
+                  1,                           # 鼻尖
+                  10,                          # 额顶
+                  338, 297, 332, 384, 385,     # 右上轮廓弧（颞/额侧）
+                  387, 388, 127, 234,          # 颞部收口（眼线高度的轮廓）
+                  109, 67, 103, 54, 21,        # 左上轮廓弧
+                  61, 291,                     # 嘴角
+                  152)                         # 下巴
+    for idx in anchor_ids:
+        _pin(lm_px[idx])
+
+    map_x, map_y = mls_similarity_maps(h, w, np.array(movers_P), np.array(movers_Q))
+
+    # 上半脸保护窗：眉线以上竖直余弦衰减到严格恒等。MLS 是全局光滑
+    # 场，锚点之间会有 1~3px 亚视觉泄漏；该区域场量本就 <2px，乘窗无
+    # 可感知差异，但保证强度拉满时发际线以上比特级不动。
+    brow_y = float(np.min(lm_px[[105, 334], 1]))
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    band = np.clip((yy - brow_y) / SLIM_PROTECT_FADE_PX, 0.0, 1.0)
+    band = band * band * (3.0 - 2.0 * band)   # smoothstep
+    id_x, id_y = identity_maps(h, w)
+    map_x = id_x + (map_x - id_x) * band
+    map_y = id_y + (map_y - id_y) * band
+    return map_x, map_y
 
 
 class BeautyEffect(Effect):

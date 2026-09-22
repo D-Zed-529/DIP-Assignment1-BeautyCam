@@ -12,8 +12,10 @@ import numpy as np
 
 from core.effects.beauty import (
     BeautyEffect, JAW_LEFT_IDS, JAW_RIGHT_IDS, enlarge_eyes, estimate_yaw_deg,
-    face_oval_mask, get_skin_mask, pose_gate, slim_face, whitening,
+    face_oval_mask, get_skin_mask, pose_gate, slim_face, slim_face_maps,
+    whitening,
 )
+from core.mls import identity_maps
 import core.effects.beauty as B
 from core.context import FaceInfo, FrameContext
 from core.infer import FACE_OVAL_IDS as OVAL_IDS
@@ -56,10 +58,19 @@ def synth_face_landmarks(frame: np.ndarray) -> np.ndarray:
     for i in range(468):
         if i not in reserved:
             lm[i] = cx / w, cy / h, 0.0   # 其余点放脸中心
-    # 眼/嘴锚点（瘦脸竖直渐变窗依赖）：下眼睑与下唇
-    lm[145] = 0.42, 0.45, 0.0
-    lm[374] = 0.58, 0.45, 0.0
-    lm[14] = 0.50, 0.66, 0.0
+    # 眼/眉/鼻/嘴锚点（MLS 锚点与竖直窗依赖，须真实分布而非堆在中心）：
+    lm[33] = 0.435, 0.42, 0.0    # 左眼外角
+    lm[133] = 0.465, 0.42, 0.0   # 左眼内角
+    lm[362] = 0.535, 0.42, 0.0   # 右眼内角
+    lm[263] = 0.565, 0.42, 0.0   # 右眼外角
+    lm[145] = 0.45, 0.45, 0.0    # 左下眼睑
+    lm[374] = 0.55, 0.45, 0.0    # 右下眼睑
+    lm[105] = 0.44, 0.36, 0.0    # 左眉
+    lm[334] = 0.56, 0.36, 0.0    # 右眉
+    lm[1] = 0.50, 0.52, 0.0      # 鼻尖
+    lm[61] = 0.46, 0.63, 0.0     # 左嘴角
+    lm[291] = 0.54, 0.63, 0.0    # 右嘴角
+    lm[14] = 0.50, 0.66, 0.0     # 下唇
     return lm
 
 
@@ -206,13 +217,25 @@ class TestSlimFace(unittest.TestCase):
         self.assertGreater(after, before + 3.0)   # 明显右移（内收）
 
     def test_slim_leaves_forehead_untouched(self):
-        """瘦脸上界在眼线渐变：额头/头顶/太阳穴不应被位移。"""
+        """瘦脸位移场钉住额头：眉线以上严格恒等（保护窗），眼下过渡带 ≤3.5px。
+
+        MLS 是全局光滑场，眉线以上由竖直余弦保护窗乘到严格 0（比特级
+        不动）；眉线到眼线的过渡带允许小幅光滑泄漏（硬置零会在眼线处
+        产生可见接缝）。断言位移场量而非像素值——高对比边缘处的像素
+        值差是重采样放大，不代表可见位移。
+        """
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
-        out = slim_face(frame, lm, strength=1.0)
-        h = frame.shape[0]
-        top = np.s_[:int(h * 0.45), :]   # 眼线（0.45h）以上区域
-        self.assertTrue(np.array_equal(out[top], frame[top]))
+        h, w = frame.shape[:2]
+        map_x, map_y = slim_face_maps(w, h, lm, strength=1.0)
+        id_x, id_y = identity_maps(h, w)
+        disp = np.hypot(map_x - id_x, map_y - id_y)
+        brow_top = int(min(lm[105, 1], lm[334, 1]) * h)
+        # 眉线以上：保护窗严格恒等（比特级）
+        self.assertTrue(np.array_equal(map_x[:brow_top, :], id_x[:brow_top, :]))
+        self.assertTrue(np.array_equal(map_y[:brow_top, :], id_y[:brow_top, :]))
+        # 眉线→眼线过渡带：光滑泄漏上限（亚视觉）
+        self.assertLessEqual(float(disp[:int(h * 0.45), :].max()), 3.5)
 
 
 class TestWhitenScope(unittest.TestCase):
