@@ -23,9 +23,12 @@ import numpy as np
 from PySide6.QtCore import QThread, Signal
 
 from core.camera import CameraSource
+from core.context import FrameContext
 from core.gestures import AutoCaptureState, any_smiling, is_v_sign
 from core.infer import InferenceEngine
-from core.pipeline import NEED_FACES, NEED_HANDS, Pipeline
+from core.pipeline import (
+    NEED_FACES, NEED_HANDS, NEED_SEGMENTATION, Pipeline,
+)
 
 # 自动拍照的触发器名（与 GUI 复选框一一对应）
 TRIGGER_MANUAL, TRIGGER_V_SIGN, TRIGGER_SMILE = "manual", "v_sign", "smile"
@@ -59,6 +62,7 @@ class CameraWorker(QThread):
         self.triggers: set[str] = triggers if triggers is not None else set()
         self._stop_flag = False
         self._capture_request = False    # 手动拍照请求（跨线程标志）
+        self._segmenter_request: Optional[str] = None   # 待切换的分割模型
         self._auto_state = AutoCaptureState()
         self._fps = 0.0
         self._last_frame_time = time.time()
@@ -69,6 +73,14 @@ class CameraWorker(QThread):
     def request_capture(self) -> None:
         """请求手动拍照（下一帧生效）。"""
         self._capture_request = True
+
+    def request_segmenter_model(self, key: str) -> None:
+        """请求切换分割模型（下一帧生效）。
+
+        会话重建必须在工作线程做 —— GUI 线程直接重建会和正在跑的
+        segment_for_video 撞上。沿用 _capture_request 同款跨线程标志模式。
+        """
+        self._segmenter_request = key
 
     def stop(self) -> None:
         self._stop_flag = True
@@ -91,6 +103,8 @@ class CameraWorker(QThread):
 
     def _loop(self) -> None:
         empty_streak = 0          # 连续空帧计数（实时源偶发空帧用）
+        frame_index = 0           # 隔帧降载的相位来源（见 pipeline.infer_needs_for）
+        self.pipeline.reset_temporal()   # 新采集源：作废旧掩膜/旧背景缓存
         while not self._stop_flag:
             ret, frame = self.source.read()
             if not ret or frame is None:
@@ -107,19 +121,19 @@ class CameraWorker(QThread):
                 break
             empty_streak = 0
 
-            # 统一推理：效果链需求 ∨ 手势触发需求
-            needs = self.pipeline.infer_needs()
-            gesture_on = bool(self.triggers)
-            if gesture_on:
-                needs |= {NEED_FACES, NEED_HANDS}
-            ctx = self.engine.process(
-                frame,
-                faces=NEED_FACES in needs,
-                hands=NEED_HANDS in needs,
-                segmentation="segmentation" in needs,
-            )
+            if self._segmenter_request is not None:
+                # 分割模型切换（GUI 请求）：会话重建只在本线程做
+                self.engine.set_segmenter_model(self._segmenter_request)
+                self._segmenter_request = None
 
-            frame = self.pipeline.process(frame, ctx)
+            try:
+                ctx = self._infer(frame, frame_index)
+                frame = self.pipeline.process(frame, ctx)
+            except Exception as exc:  # noqa: BLE001 —— 单帧兜底：坏帧跳过而非终止演示
+                self.status_message.emit(f"跳过一帧（处理异常：{exc}）")
+                frame_index += 1
+                continue
+            frame_index += 1
             self.face_count_changed.emit(len(ctx.faces))
 
             # 自动触发判定（时间持续 + 冷却，见 core/gestures）
@@ -148,6 +162,22 @@ class CameraWorker(QThread):
                 self._fps = inst
             self._last_frame_time = t
             self.fps_changed.emit(self._fps)
+
+    def _infer(self, frame: np.ndarray, frame_index: int) -> FrameContext:
+        """统一推理：效果链的本帧需求 ∨ 手势触发需求。
+
+        隔帧降载只作用于效果链需求 —— 手势/笑脸判定必须每帧，否则 V 手势的
+        持续时间判定会因缺帧而不断被打断。
+        """
+        needs = self.pipeline.infer_needs_for(frame_index)
+        if self.triggers:
+            needs |= {NEED_FACES, NEED_HANDS}
+        return self.engine.process(
+            frame,
+            faces=NEED_FACES in needs,
+            hands=NEED_HANDS in needs,
+            segmentation=NEED_SEGMENTATION in needs,
+        )
 
     def _save_photo(self, frame: np.ndarray, trigger: str) -> None:
         filename = os.path.join(

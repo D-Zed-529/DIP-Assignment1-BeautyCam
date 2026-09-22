@@ -99,6 +99,78 @@ class TestPipeline(unittest.TestCase):
             pipe.set_params("no_such_effect", x=1)
 
 
+class ThrottledEffect(RecEffect):
+    """按固定间隔声明推理需求的桩效果（模拟重推理隔帧降载）。"""
+
+    def __init__(self, name: str, needs, interval: int, enabled: bool = True):
+        super().__init__(name, needs)
+        self._interval = interval
+        self.set_enabled(enabled)
+
+    def inference_interval(self, need: str) -> int:
+        return self._interval
+
+
+class TestInferNeedsThrottle(unittest.TestCase):
+    """infer_needs_for 的隔帧节流（Phase 3 分割 / Phase 2 低光重推理降载）。"""
+
+    def test_default_interval_runs_every_frame(self):
+        pipe = Pipeline([RecEffect("a", needs={NEED_FACES})])
+        for i in range(5):
+            self.assertEqual(pipe.infer_needs_for(i), {NEED_FACES})
+
+    def test_interval_keeps_phase(self):
+        pipe = Pipeline([ThrottledEffect("a", {"segmentation"}, interval=4)])
+        hits = ["segmentation" in pipe.infer_needs_for(i) for i in range(8)]
+        self.assertEqual(hits, [True, False, False, False,
+                                True, False, False, False])
+
+    def test_first_frame_always_runs_everything(self):
+        """首帧必跑全量 —— 否则刚开效果会出现"拿不到掩膜"的空窗。"""
+        pipe = Pipeline([ThrottledEffect("a", {"segmentation"}, interval=7)])
+        self.assertIn("segmentation", pipe.infer_needs_for(0))
+
+    def test_infer_needs_equals_frame_zero(self):
+        """infer_needs() 保留原语义（全量并集），供不关心隔帧的调用方使用。"""
+        pipe = Pipeline([
+            ThrottledEffect("a", {"segmentation"}, interval=4),
+            RecEffect("b", needs={NEED_FACES}),
+        ])
+        self.assertEqual(pipe.infer_needs(), pipe.infer_needs_for(0))
+        self.assertEqual(pipe.infer_needs(), {"segmentation", NEED_FACES})
+
+    def test_disabled_effect_not_counted(self):
+        pipe = Pipeline([ThrottledEffect("a", {"segmentation"}, interval=1,
+                                          enabled=False)])
+        self.assertEqual(pipe.infer_needs_for(0), set())
+        self.assertEqual(pipe.infer_needs_for(4), set())
+
+    def test_union_across_effects_with_different_intervals(self):
+        """同一 need 被多个效果需要时取并：任一效果要求本帧跑就跑。"""
+        pipe = Pipeline([
+            ThrottledEffect("slow", {"segmentation"}, interval=4),
+            ThrottledEffect("fast", {"segmentation"}, interval=2),
+        ])
+        hits = ["segmentation" in pipe.infer_needs_for(i) for i in range(5)]
+        self.assertEqual(hits, [True, False, True, False, True])
+
+    def test_zero_or_negative_interval_clamped_to_one(self):
+        """非法间隔不应导致除零或永久跳过推理。"""
+        pipe = Pipeline([ThrottledEffect("a", {"segmentation"}, interval=0)])
+        for i in range(3):
+            self.assertIn("segmentation", pipe.infer_needs_for(i))
+        pipe2 = Pipeline([ThrottledEffect("b", {"segmentation"}, interval=-3)])
+        self.assertIn("segmentation", pipe2.infer_needs_for(1))
+
+    def test_real_segment_effect_declares_interval(self):
+        from core.effects.segment import SegmentEffect
+        eff = SegmentEffect(enabled=True, params={"infer_interval": 3})
+        pipe = Pipeline([eff])
+        hits = ["segmentation" in pipe.infer_needs_for(i) for i in range(6)]
+        self.assertEqual(hits, [True, False, False, True, False, False])
+        self.assertEqual(eff.inference_interval("faces"), 1)
+
+
 class TestLowLightEffect(unittest.TestCase):
     def test_dark_frame_enhanced(self):
         frame = np.full((60, 80, 3), 30, np.uint8)   # 暗帧

@@ -9,6 +9,26 @@ P0-1 冒烟结论（2026-09，macOS darwin 27 / Apple M4）：
 
 FaceDetector 已弃用：macOS Tasks 版存在 Metal 后处理缺陷；人脸框改由
 FaceMesh 轮廓关键点导出（见 _landmarks_to_face_info），还省一次前向。
+
+P3-0 分割模型冒烟结论（2026-09，1280×720，本机 CPU）：
+  - `selfie_multiclass_256x256.tflite`（16.4MB，6 类）：**155 ms/帧**，且耗时与
+    输入分辨率无关（256×144 与 1280×720 同为 ~140ms），不取任何输出仍 ~142ms
+    —— 瓶颈纯在模型推理本身；照此直接接虚拟背景只能跑到 ~7fps，必然不达标。
+  - `selfie_segmenter.tflite`（250KB，二元人/非人）：**13.2 ms/帧**，快 11.7 倍。
+    虚拟背景只需前景/背景二分类，多分类那 5 类信息用不上却要多付 10 倍算力，
+    故**默认二元模型**；多分类保留为可切换选项，用于"质量 vs 速度"对比实验。
+  - **⚠️ 两个模型的类别编码与置信图极性恰好相反**（详见 SEGMENTER_SPECS）：
+      二元      : 类别 0 = 人 / 255 = 背景；`conf[0]` = **人**的概率
+      多分类    : 类别 0 = 背景 / 1..5 = 人；`conf[0]` = **背景**的概率
+    搞反**不会抛异常**，只会静默产出整体反相的掩膜（人景对调）或全幅掩膜
+    （背景替换什么都不换），是这块最容易埋雷的地方。本模块曾两次把这张表写反
+    （"conf[0] 都是背景概率"这一说法看起来非常合理），因此单测用**与假设无关
+    的探针法**独立复核（图像四角必为背景、画面中下部必为人），并加了运行时
+    边框先验自检（_self_check_border）作为第二道保险。
+  - 二元模型的置信度本身已接近二值（背景区 alpha 恒为 0.000），多分类的则有
+    系统性偏置（背景区 alpha 恒为 ~0.084），直接当 alpha 用会给新背景叠上一层
+    均匀的 8.4% 鬼影（表现为背景发灰）。用对比度拉伸即可归零 —— 详见
+    core/effects/segment.py 的 matte_contrast 及其模块头实测数据。
 """
 
 from __future__ import annotations
@@ -32,9 +52,40 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_FILES = {
     "face_landmarker": "face_landmarker.task",
     "hand_landmarker": "hand_landmarker.task",
-    # Phase 3 起用的自拍分割（multiclass：0背景/1头发/2躯体皮肤/3面部皮肤/4衣服/5其他）
+    # Phase 3 自拍分割，两个模型都保留（切换见 InferenceEngine.set_segmenter_model）：
+    #   binary     二元「人 / 非人」，250KB，13.2ms —— 虚拟背景默认用它
+    #   multiclass 6 类（0背景/1头发/2躯体皮肤/3面部皮肤/4衣服/5其他），16.4MB，155ms
+    "selfie_segmenter_binary": "selfie_segmenter.tflite",
     "selfie_segmenter": "selfie_multiclass_256x256.tflite",
 }
+
+DEFAULT_SEGMENTER = "selfie_segmenter_binary"
+
+# 分割模型 -> 建议的推理间隔帧数（虚拟背景的 SegmentEffect 据此设置隔帧降载）。
+# 二元模型 13ms 可每帧跑；多分类 155ms 必须隔帧，靠时域平滑复用中间帧。
+SEGMENTER_INTERVAL = {
+    "selfie_segmenter_binary": 1,
+    "selfie_segmenter": 4,
+}
+
+# 分割模型规格表 —— 两个模型的「类别编码」与「置信图极性」**恰好相反**，
+# 且搞反了不抛异常、只静默产出反转掩膜（人景对调）或全幅掩膜（什么都不换），
+# 所以必须按模型显式声明，不能靠启发式猜。
+#
+# 用**与假设无关的探针法**实测确认（图像四角必为背景、画面中下部必为人；
+# 见 tests/test_infer.py::TestSegmenterSemantics 的同一套探针）：
+#   binary     类别 0 = 人 / 255 = 背景，conf[0] = **人**的概率
+#   multiclass 类别 0 = 背景 / 1..5 = 人，conf[0] = **背景**的概率
+#
+# 注意：这张表曾经两次被写反（"conf[0] 都是背景概率"看起来非常合理），
+# 因此配套的单测用探针法独立复核，而不是在表内自证。
+SEGMENTER_SPECS = {
+    "selfie_segmenter_binary": {"person_is_zero": True, "alpha_invert": False},
+    "selfie_segmenter": {"person_is_zero": False, "alpha_invert": True},
+}
+
+# 边框先验自检阈值：画面边缘 alpha 均值超过它就告警（见 _self_check_border）
+BORDER_FOREGROUND_WARN = 0.5
 
 # FaceMesh 脸部轮廓关键点（一期沿用），用于生成人脸区域掩膜/人脸框
 FACE_OVAL_IDS = [
@@ -70,6 +121,39 @@ def _landmarks_to_face_info(lm: np.ndarray, blendshapes=None) -> FaceInfo:
     return FaceInfo(landmarks=lm, box=box, smile=smile)
 
 
+def category_to_person_mask(cat: np.ndarray, person_is_zero: bool) -> np.ndarray:
+    """分割类别掩膜 -> 人像 bool 掩膜。
+
+    编码随模型而变（见 SEGMENTER_SPECS）：二元模型 0=人/255=背景，
+    多分类模型 0=背景/1..5=人。搞反了会得到整体反相的掩膜，且不会报错。
+    """
+    return (cat == 0) if person_is_zero else (cat > 0)
+
+
+def foreground_from_confidence(conf0: np.ndarray,
+                              alpha_invert: bool) -> np.ndarray:
+    """单张置信图 -> 前景概率 float32（0~1，未做任何锐化）。
+
+    alpha_invert 由模型决定（见 SEGMENTER_SPECS）：多分类的 conf[0] 是背景概率
+    需取反，二元的 conf[0] 直接就是前景概率。
+    """
+    a = conf0.astype(np.float32)
+    return np.clip(1.0 - a if alpha_invert else a, 0.0, 1.0)
+
+
+def border_foreground_ratio(alpha: np.ndarray, margin: int = 12) -> float:
+    """画面四周边缘区域内 alpha 的均值。
+
+    自拍场景下画面四边几乎总是背景，因此这个值应接近 0。它是**与掩膜语义无关**
+    的独立参照（不依赖任何类别/置信图约定），用于运行时自检掩膜是否整体反相。
+    """
+    m = max(1, int(margin))
+    band = np.concatenate([
+        alpha[:m].ravel(), alpha[-m:].ravel(),
+        alpha[:, :m].ravel(), alpha[:, -m:].ravel()])
+    return float(band.mean())
+
+
 class InferenceEngine:
     """每帧统一推理入口：FaceMesh / Hands / 自拍分割，结果填入 FrameContext。
 
@@ -77,7 +161,8 @@ class InferenceEngine:
     """
 
     def __init__(self, models_dir: Path | str = MODELS_DIR,
-                 delegate: int | None = None):
+                 delegate: int | None = None,
+                 segmenter_model: str = DEFAULT_SEGMENTER):
         self.models_dir = Path(models_dir)
         # None 表示用 mediapipe 默认；本机验证默认委托稳定，但保险起见
         # 全部显式 CPU（GPU/Metal 委托在本机崩溃，见模块头注释）
@@ -85,12 +170,45 @@ class InferenceEngine:
             delegate if delegate is not None
             else mp_tasks.BaseOptions.Delegate.CPU
         )
+        if segmenter_model not in SEGMENTER_SPECS:
+            raise ValueError(f"未知分割模型：{segmenter_model}")
+        self._segmenter_key = segmenter_model
         self._face_lm: Optional[vision.FaceLandmarker] = None
         self._hand_lm: Optional[vision.HandLandmarker] = None
         self._segmenter: Optional[vision.ImageSegmenter] = None
+        # 边框先验自检只做一次（告警用，不自动翻转掩膜）
+        self._border_checked = False
         self._ts = 0          # VIDEO 模式时间戳必须严格递增
         self._frame_id = 0
         self._lock = threading.Lock()   # 会话懒加载互斥
+
+    # ------- 分割模型选择 -------
+
+    @property
+    def segmenter_model(self) -> str:
+        return self._segmenter_key
+
+    @property
+    def segmenter_spec(self) -> dict:
+        return SEGMENTER_SPECS[self._segmenter_key]
+
+    @property
+    def recommended_interval(self) -> int:
+        """当前分割模型建议的推理间隔帧数（GUI 据此设 SegmentEffect 的 infer_interval）。"""
+        return SEGMENTER_INTERVAL[self._segmenter_key]
+
+    def set_segmenter_model(self, key: str) -> None:
+        """切换分割模型（关闭旧会话，下次推理时重建）。"""
+        if key not in SEGMENTER_SPECS:
+            raise ValueError(f"未知分割模型：{key}")
+        with self._lock:
+            if key == self._segmenter_key:
+                return
+            if self._segmenter is not None:
+                self._segmenter.close()
+                self._segmenter = None
+            self._segmenter_key = key
+            self._border_checked = False
 
     # ------- 会话懒加载 -------
 
@@ -136,9 +254,11 @@ class InferenceEngine:
                 if self._segmenter is None:
                     self._segmenter = vision.ImageSegmenter.create_from_options(
                         vision.ImageSegmenterOptions(
-                            base_options=self._base("selfie_segmenter"),
+                            base_options=self._base(self._segmenter_key),
                             running_mode=vision.RunningMode.VIDEO,
+                            # 硬掩膜（类别）给 person_mask，置信图给软 alpha
                             output_category_mask=True,
+                            output_confidence_masks=True,
                         ))
         return self._segmenter
 
@@ -172,12 +292,33 @@ class InferenceEngine:
                 ctx.hands.append(info)
 
         if segmentation:
+            spec = self.segmenter_spec
             r = self._get_segmenter().segment_for_video(mp_img, self._ts)
             cat = np.squeeze(r.category_mask.numpy_view())   # (h, w)，0.10 为 2 维
-            # 前景 = 非背景类（头发/皮肤/衣服等全部算人）
-            ctx.person_mask = np.where(cat == 0, 0, 255).astype(np.uint8)
+            person = category_to_person_mask(cat, spec["person_is_zero"])
+            ctx.person_mask = np.where(person, 255, 0).astype(np.uint8)
+            # 软 alpha：由置信图导出的原始前景概率（锐化/精修留给 SegmentEffect）
+            if r.confidence_masks:
+                ctx.person_alpha = foreground_from_confidence(
+                    r.confidence_masks[0].numpy_view(), spec["alpha_invert"])
+                self._self_check_border(ctx.person_alpha)
 
         return ctx
+
+    def _self_check_border(self, alpha: np.ndarray) -> None:
+        """边框先验自检：四边几乎总是背景，若边缘 alpha 偏高则掩膜可能整体反相。
+
+        只告警不自动翻转 —— 自动翻转会在"人物占满画面"时误判，反而制造故障。
+        与掩膜语义无关的独立参照，能抓住"模型版本升级后约定变了"这类静默问题。
+        """
+        if self._border_checked:
+            return
+        self._border_checked = True
+        ratio = border_foreground_ratio(alpha)
+        if ratio > BORDER_FOREGROUND_WARN:
+            print(f"[警告] 分割掩膜疑似整体反相：画面边缘 alpha 均值 {ratio:.2f} "
+                  f"(> {BORDER_FOREGROUND_WARN})。请核对 "
+                  f"core/infer.py 的 SEGMENTER_SPECS 与模型 {self._segmenter_key} 的约定。")
 
     def close(self) -> None:
         for s in (self._face_lm, self._hand_lm, self._segmenter):

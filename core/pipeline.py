@@ -53,6 +53,23 @@ class Effect(ABC):
     def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
         """处理一帧（BGR），返回处理后的帧。ctx 为本帧共享推理结果。"""
 
+    def inference_interval(self, need: str) -> int:
+        """该效果对某类推理的调用间隔（帧数）。1 = 每帧都跑；N = 每 N 帧跑一次。
+
+        用于重推理降载（PLAN §3.3）：代价高的模型隔帧跑，中间帧由效果自身的
+        时域状态复用上次结果（如 SegmentEffect 复用上一帧的 alpha）。
+        声明为方法而非类属性，便于按参数（如所选的模型）动态决定。
+        """
+        return 1
+
+    def reset_temporal(self) -> None:
+        """清空跨帧状态（切换采集源、逐张独立批跑之前调用）。
+
+        无状态的效果不必实现（默认空实现）。切换采集源时尺寸/场景突变，
+        残留的时域状态（缓存的掩膜、背景图等）必须作废，否则会闪一帧旧结果
+        甚至因尺寸不符让帧循环抛异常。
+        """
+
     # ------- 参数读写（线程安全） -------
 
     @property
@@ -108,13 +125,33 @@ class Pipeline:
     # ------- 推理需求聚合 -------
 
     def infer_needs(self) -> set[str]:
-        """所有启用中效果的推理需求并集（worker 与手势需求做 OR）。"""
+        """所有启用中效果的推理需求并集。
+
+        等价于 infer_needs_for(0)（第 0 帧必跑），保留此签名给不关心隔帧的调用方。
+        """
+        return self.infer_needs_for(0)
+
+    def infer_needs_for(self, frame_index: int) -> set[str]:
+        """本帧实际要跑的推理需求（已计入各效果的 inference_interval 隔帧降载）。
+
+        frame_index 从 0 起；0 % N == 0 恒成立，因此首帧一定跑全量推理，
+        不会出现"刚打开效果却拿不到掩膜"的空窗。
+        """
         needs: set[str] = set()
         for name in self._order:
             e = self._effects[name]
-            if e.enabled:
-                needs |= set(e.needs)
+            if not e.enabled:
+                continue
+            for need in e.needs:
+                interval = max(1, int(e.inference_interval(need)))
+                if frame_index % interval == 0:
+                    needs.add(need)
         return needs
+
+    def reset_temporal(self) -> None:
+        """清空全部效果的跨帧状态（切换采集源 / 逐张独立批跑前调用）。"""
+        for name in self._order:
+            self._effects[name].reset_temporal()
 
     # ------- 参数/开关（GUI 线程调用） -------
 
