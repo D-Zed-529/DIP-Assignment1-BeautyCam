@@ -25,8 +25,9 @@ from ..infer import FACE_OVAL_IDS
 SMOOTH_DIAMETER = 9        #双边滤波邻域直径（一期口径）
 SMOOTH_SIGMA = 60          #双边滤波颜色/空间 sigma（一期口径）
 WHITEN_L_MAX = 30.0        # 美白滑杆上限（LAB L 增量；一期 15~18 推荐档）
-SLIM_MAX_SHIFT_RATIO = 0.025   # 瘦脸强度=1.0 时的最大水平位移（占帧宽比例）
-SLIM_BAND_SIGMA = 30.0     # 瘦脸影响域高斯衰减尺度（像素）
+SLIM_MAX_SHIFT_RATIO = 0.055   # 瘦脸强度=1.0 时的最大水平位移（占帧宽比例）
+SLIM_INSIDE_SIGMA = 58.0   # 轮廓内侧（脸颊）衰减尺度：宽拖拽，脸颊整体内收
+SLIM_OUTSIDE_SIGMA = 22.0   # 轮廓外侧（背景/耳）衰减尺度：窄滑动，仅轮廓边内移
 EYE_RADIUS_RATIO = 0.045   # 大眼作用半径（占帧宽比例，作半径上限兜底）
 EYE_RADIUS_FROM_CORNERS = 0.85   # 大眼半径 = 眼角距 × 系数（自适应透视缩短）
 EYE_MIN_CORNER_RATIO = 0.02      # 眼角距（归一化）低于此值视为透视塌缩，跳过该眼
@@ -36,9 +37,11 @@ EYE_STRENGTH_MAX = 0.5     # 大眼滑杆上限（一期默认 0.18）
 # 2D 液化变形隐含"正脸假设"：头偏航后远端下颌链的投影塌缩进脸颊中部，
 # 变形带会横穿脸面产生拉扯伪影。通行做法（MediaPipe 刚体变换头姿估计、
 # MLLS 变形文献）是按头姿给变形强度加门控，超阈值直接关闭。
-YAW_FULL_DEG = 15.0        # |yaw| ≤ 此值：变形全强度
-YAW_ZERO_DEG = 32.0        # |yaw| ≥ 此值：变形完全关闭
-FAR_SIDE_SKIP_DEG = 12.0   # |yaw| 超过此值：跳过"远端"下颌链（投影已塌缩）
+# 实机反馈：窄带+紧门控让正脸瘦脸几乎不可见 → 幅度与内侧衰减放宽，
+# 门控全强度上限放宽到 20°（正脸小幅姿态波动不再吃掉强度）。
+YAW_FULL_DEG = 20.0        # |yaw| ≤ 此值：变形全强度
+YAW_ZERO_DEG = 40.0        # |yaw| ≥ 此值：变形完全关闭
+FAR_SIDE_SKIP_DEG = 15.0   # |yaw| 超过此值：跳过"远端"下颌链（投影已塌缩）
 
 # 左/右眼关键点（外角、内角、上睑、下睑 —— 一期口径）
 LEFT_EYE_IDS = (33, 133, 159, 145)
@@ -173,17 +176,21 @@ def enlarge_eyes(frame_bgr: np.ndarray, landmarks: np.ndarray,
 
 
 def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
-              strength: float = 0.35,
+              strength: float = 0.40,
               yaw_deg: float | None = None) -> np.ndarray:
-    """瘦脸：下颌两侧带状区域向脸中心收缩（liquify，remap 实现）。
+    """瘦脸：下颌两侧向脸中心收缩（liquify，remap 实现，内外不对称场）。
 
-    方向语义（曾实现反过）：remap 的采样坐标取"更靠脸外侧"的像素，
-    即内容向中心移动 => 轮廓内收（瘦）；若采样坐标朝中心收缩则是放大
-    （大眼正是利用这一点），会把鼻脸撑宽。
+    位移场设计（实机反馈"效果非常不明显"后的第二版）：
+      - 方向：采样坐标取"更靠脸外侧"的像素 => 内容向中心移动（内收）；
+      - 轮廓**内侧**（脸颊）用宽衰减（σ≈58px）：脸颊整体被拖向中心，
+        而非只有贴着下颌线的一条窄管在动；
+      - 轮廓**外侧**（背景/耳）用窄衰减（σ≈22px）：只有轮廓边滑动内移，
+        背景大面积不受牵连；
+      - 幅度上限 0.055×帧宽（1280 下强度 1.0 ≈ 70px，默认 0.4 ≈ 28px）。
 
     侧脸防伪影：
-      - 头姿门控：|yaw| 从 15° 起线性衰减，32° 起完全关闭；
-      - |yaw| > 12° 时跳过"远端"下颌链——头转过去后远端链在 2D 投影上
+      - 头姿门控：|yaw| ≤20° 全强度，20°~40° 线性衰减，≥40° 关闭；
+      - |yaw| > 15° 时跳过"远端"下颌链——头转过去后远端链在 2D 投影上
         塌缩进脸颊中部（不再是真的轮廓），沿它液化会横穿脸面拉出伪影。
         远端判定不看 yaw 符号（免受镜像/左右习惯干扰），直接比较两条链
         的 2D 质心谁离鼻尖更近。
@@ -198,45 +205,63 @@ def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
     h, w = frame_bgr.shape[:2]
     lm_px = landmarks[:, :2] * np.array([w, h], dtype=np.float32)
     nose_x = float(lm_px[1, 0])   # 鼻尖 x 作为脸中心参考
-    out = frame_bgr.copy()
     max_shift = strength * SLIM_MAX_SHIFT_RATIO * w
-    margin = int(SLIM_BAND_SIGMA * 3)
     chains = [JAW_LEFT_IDS, JAW_RIGHT_IDS]
     if abs(yaw_deg) > FAR_SIDE_SKIP_DEG:
         # 远端链 = 2D 质心更靠近鼻尖的那条（投影塌缩方）
         chains.sort(key=lambda ids: abs(float(lm_px[ids, 0].mean()) - nose_x))
         chains = chains[1:]     # 跳过最靠近鼻尖的一条
+
+    margin = int(SLIM_INSIDE_SIGMA * 2.5)
+    all_pts = np.vstack([lm_px[c] for c in chains])
+    y0 = int(max(all_pts[:, 1].min() - margin, 0))
+    y1 = int(min(all_pts[:, 1].max() + margin, h))
+    x_lo = int(max(all_pts[:, 0].min() - margin, 0))
+    x_hi = int(min(all_pts[:, 0].max() + margin, w))
+    if x_hi - x_lo < 8 or y1 - y0 < 8:
+        return frame_bgr
+
+    # 脸轮廓内侧掩膜（内外不对称衰减用）
+    oval_full = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(oval_full, [lm_px[FACE_OVAL_IDS].astype(np.int32)], 255)
+    inside = oval_full[y0:y1, x_lo:x_hi] > 0
+    sigma = np.where(inside, SLIM_INSIDE_SIGMA, SLIM_OUTSIDE_SIGMA)
+
+    # 竖直渐变窗：眼线以下渐起、嘴线以下全量——链条顶端（耳侧）的带宽
+    # 不再上探太阳穴/发际线（实机"正脸效果不好"来源之一：鬓角头发被拖）
+    y_eye = max(float(lm_px[145, 1]), float(lm_px[374, 1]))   # 左/右下眼睑
+    y_mouth = float(lm_px[14, 1])                             # 下唇内侧点
+    v_span = max(y_mouth - y_eye, 1.0)
+    v_win = np.clip(
+        (np.arange(y0, y1, dtype=np.float32)[:, None] - y_eye) / v_span,
+        0.0, 1.0) * np.ones((x_hi - x_lo,), np.float32)[None, :]
+
+    # ---- 两侧链的位移场合成为单一总场，只做一次 remap ----
+    # 位移场 = Σ 高斯衰减 × 外向单位向量 × 幅度，天然连续：
+    #   - 无需内容 alpha 混合（混合会产生"原位+位移"重影，观感位移减半
+    #     且发虚——实机"瘦脸不明显"的根因）；
+    #   - ROI 边界处位移已衰减到 ~0，无接缝。
+    xs = np.arange(x_lo, x_hi, dtype=np.float32)[None, :]
+    outward = np.sign(xs - nose_x)
+    shift_total = np.zeros((y1 - y0, x_hi - x_lo), np.float32)
     for side_ids in chains:
         pts = lm_px[side_ids]
-        y0 = int(max(pts[:, 1].min() - margin, 0))
-        y1 = int(min(pts[:, 1].max() + margin, h))
-        x_lo = int(max(pts[:, 0].min() - margin, 0))
-        x_hi = int(min(pts[:, 0].max() + margin, w))
-        if x_hi - x_lo < 8 or y1 - y0 < 8:
-            continue
         # 到下颌链折线的最短距离场：ROI 内画 1px 链线 + 距离变换
-        # （比逐像素×链点的广播计算快一个量级，且距离对象是折线而非离散点。
-        #   注意不能用 LINE_AA：抗锯齿值 <255 会让"补图"没有零像素，DT 失效）
+        # （不能用 LINE_AA：抗锯齿值 <255 让"补图"没有零像素，DT 失效）
         line = np.zeros((y1 - y0, x_hi - x_lo), np.uint8)
         cv2.polylines(line, [(pts - [x_lo, y0]).astype(np.int32)], False, 255, 1)
         line = cv2.threshold(line, 127, 255, cv2.THRESH_BINARY)[1]
         dist = cv2.distanceTransform(255 - line, cv2.DIST_L2, 3)
-        w_band = np.exp(-(dist / SLIM_BAND_SIGMA) ** 2).astype(np.float32)
-        # 从"更靠外侧"的位置采样 => 内容向脸中心移动（内收）
-        xs = np.arange(x_lo, x_hi, dtype=np.float32)[None, :]
-        outward = np.sign(xs - nose_x)
-        shift = outward * (max_shift * w_band)
-        map_x = (xs + shift).astype(np.float32)
-        ys = np.arange(y0, y1, dtype=np.float32)[:, None] * np.ones_like(map_x)
-        roi = cv2.remap(frame_bgr, map_x, ys,
-                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        # 按 w_band 混合写入：远离本链的区域保持 out 原样。左右链的 ROI
-        # 在下巴处重叠，硬切 ROI 会让后处理一侧的近恒等场覆盖掉先处理
-        # 一侧的位移（互相抵消），alpha 混合则自然叠加。
-        alpha = w_band[..., None].astype(np.float32)
-        patch = roi.astype(np.float32) * alpha + \
-            out[y0:y1, x_lo:x_hi].astype(np.float32) * (1.0 - alpha)
-        out[y0:y1, x_lo:x_hi] = np.rint(patch).astype(np.uint8)
+        wb = np.exp(-(dist / sigma) ** 2).astype(np.float32)
+        shift_total += outward * (max_shift * wb * v_win)
+
+    # 从"更靠外侧"的位置采样 => 内容向脸中心移动（内收）
+    map_x = (xs + shift_total).astype(np.float32)
+    map_y = np.arange(y0, y1, dtype=np.float32)[:, None] * np.ones_like(map_x)
+    out = frame_bgr.copy()
+    out[y0:y1, x_lo:x_hi] = cv2.remap(
+        frame_bgr, map_x, map_y,
+        cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     return out
 
 
@@ -252,7 +277,7 @@ class BeautyEffect(Effect):
             "smooth": 0.6,       # 磨皮混合比 0~1（一期 0.6）
             "whiten": 15.0,      # 美白强度（LAB L 增量）0~30（一期 15）
             "whiten_scope": "skin",  # 美白范围："skin" 全身肤色 / "face" 仅脸部
-            "slim": 0.35,        # 瘦脸强度 0~1
+            "slim": 0.40,        # 瘦脸强度 0~1
             "eye_enabled": False,  # 大眼开关（一期默认关）
             "eye_strength": 0.18,   # 大眼强度 0~0.5（一期 0.18）
         }

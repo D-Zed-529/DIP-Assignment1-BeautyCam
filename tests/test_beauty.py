@@ -14,6 +14,7 @@ from core.effects.beauty import (
     BeautyEffect, JAW_LEFT_IDS, JAW_RIGHT_IDS, enlarge_eyes, estimate_yaw_deg,
     face_oval_mask, get_skin_mask, pose_gate, slim_face, whitening,
 )
+import core.effects.beauty as B
 from core.context import FaceInfo, FrameContext
 from core.infer import FACE_OVAL_IDS as OVAL_IDS
 
@@ -38,30 +39,27 @@ def synth_face_frame(w=640, h=480, seed=42) -> np.ndarray:
 
 
 def synth_face_landmarks(frame: np.ndarray) -> np.ndarray:
-    """合成 468 点归一化关键点：轮廓椭圆 + 下颌两侧点。"""
+    """合成 468 点归一化关键点（解剖一致版）。
+
+    FACE_OVAL 序从额顶 (10) 起沿轮廓一圈，每个 id 依序间隔 10°、起点在
+    正上方（θ=270°，图像 y 向下）。下颌链是轮廓子序列，自然落在下弧，
+    轮廓多边形保持凸——瘦脸的"内外"判定依赖这一点。
+    """
+    import math
     h, w = frame.shape[:2]
     lm = np.zeros((468, 3), np.float32)
     cx, cy, rx, ry = w / 2, h / 2, w / 5, h / 3
-    t = np.linspace(0, 2 * np.pi, len(OVAL_IDS), endpoint=False)
-    for idx, ang in zip(OVAL_IDS, t):
-        lm[idx] = (cx + rx * np.cos(ang)) / w, (cy + ry * np.sin(ang)) / h, 0.0
+    for k, idx in enumerate(OVAL_IDS):
+        th = math.radians((270.0 + 10.0 * k) % 360.0)
+        lm[idx] = (cx + rx * np.cos(th)) / w, (cy + ry * np.sin(th)) / h, 0.0
     reserved = set(OVAL_IDS) | set(JAW_LEFT_IDS) | set(JAW_RIGHT_IDS)
     for i in range(468):
         if i not in reserved:
-            lm[i] = cx / w, cy / h, 0.0
-    # 下颌两侧：左颊 x < 中心，右颊 x > 中心，y 在下半段（两侧各自长度）
-    ys_left = np.linspace(cy + ry * 0.55, cy + ry * 0.95, len(JAW_LEFT_IDS))
-    ys_right = np.linspace(cy + ry * 0.55, cy + ry * 0.95, len(JAW_RIGHT_IDS))
-    left_xs = np.linspace(cx - rx, cx - rx * 0.2, len(JAW_LEFT_IDS))
-    right_xs = np.linspace(cx + rx * 0.2, cx + rx, len(JAW_RIGHT_IDS))
-    for idx, x, y in zip(JAW_LEFT_IDS, left_xs, ys_left):
-        lm[idx] = x / w, y / h, 0.0
-    for idx, x, y in zip(JAW_RIGHT_IDS, right_xs, ys_right):
-        lm[idx] = x / w, y / h, 0.0
-    # 234/454 是真实左右脸缘点（estimate_yaw_deg 依赖）；454 同时是右链端点，
-    # 故此覆盖放在下颌循环之后，取对称位置
-    lm[234] = (cx - rx * 0.95) / w, (cy + ry * 0.3) / h, 0.0
-    lm[454] = (cx + rx * 0.95) / w, (cy + ry * 0.3) / h, 0.0
+            lm[i] = cx / w, cy / h, 0.0   # 其余点放脸中心
+    # 眼/嘴锚点（瘦脸竖直渐变窗依赖）：下眼睑与下唇
+    lm[145] = 0.42, 0.45, 0.0
+    lm[374] = 0.58, 0.45, 0.0
+    lm[14] = 0.50, 0.66, 0.0
     return lm
 
 
@@ -208,12 +206,12 @@ class TestSlimFace(unittest.TestCase):
         self.assertGreater(after, before + 3.0)   # 明显右移（内收）
 
     def test_slim_leaves_forehead_untouched(self):
-        """瘦脸作用域限定在下颌带，额头/头顶不应被位移。"""
+        """瘦脸上界在眼线渐变：额头/头顶/太阳穴不应被位移。"""
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
         out = slim_face(frame, lm, strength=1.0)
         h = frame.shape[0]
-        top = np.s_[:int(h * 0.45), :]   # 头顶区（下颌带之上）
+        top = np.s_[:int(h * 0.45), :]   # 眼线（0.45h）以上区域
         self.assertTrue(np.array_equal(out[top], frame[top]))
 
 
@@ -304,14 +302,15 @@ class TestPoseGate(unittest.TestCase):
         # 左半压缩 35% → 远端在左，yaw 约 (1-0.65)/(1+0.65)*90 ≈ 19°
         lm = yawed_face_landmarks(frame, squeeze=0.35)
         yaw = estimate_yaw_deg(lm)
-        self.assertGreater(yaw, 12.0)
-        self.assertLess(yaw, 32.0)
+        self.assertGreater(yaw, B.FAR_SIDE_SKIP_DEG)
+        self.assertLess(yaw, B.YAW_ZERO_DEG)
 
     def test_pose_gate_ramp(self):
         self.assertEqual(pose_gate(0.0), 1.0)
-        self.assertEqual(pose_gate(-15.0), 1.0)
-        self.assertAlmostEqual(pose_gate(23.5), 0.5, places=6)
-        self.assertEqual(pose_gate(32.0), 0.0)
+        self.assertEqual(pose_gate(-B.YAW_FULL_DEG), 1.0)
+        mid = (B.YAW_FULL_DEG + B.YAW_ZERO_DEG) / 2
+        self.assertAlmostEqual(pose_gate(mid), 0.5, places=6)
+        self.assertEqual(pose_gate(B.YAW_ZERO_DEG), 0.0)
         self.assertEqual(pose_gate(80.0), 0.0)
 
     def test_slim_disabled_at_large_yaw(self):
@@ -320,21 +319,62 @@ class TestPoseGate(unittest.TestCase):
         out = slim_face(frame, lm, strength=1.0, yaw_deg=40.0)
         self.assertTrue(np.array_equal(out, frame))
 
-    def test_slim_far_side_skipped(self):
-        """侧脸（中等偏航）时远端（塌缩侧）下颌链不再被液化。"""
+    def test_slim_far_side_suppressed(self):
+        """侧脸（中等偏航）时远端（塌缩侧）位移远小于近端（真实轮廓侧）。
+
+        远端链被跳过后，仅剩近端宽内侧场的跨中线残余影响——语义是
+        "远端不再被直接液化"，而非逐位不变。
+        """
         frame = synth_face_frame()
         lm = yawed_face_landmarks(frame, squeeze=0.35)
         yaw = estimate_yaw_deg(lm)
-        self.assertGreater(abs(yaw), 12.0)   # 触发远端跳过
+        self.assertGreater(abs(yaw), B.FAR_SIDE_SKIP_DEG)
         h, w = frame.shape[:2]
-        # 在远端（左，塌缩侧）链中点放标记：应完全不动
+
+        def marker_centroid(img, x, y, win=70):
+            """只在与预期位置 win 半径内找红色标记，避免串扰。"""
+            m = (img[:, :, 2] > 200) & (img[:, :, 1] < 80) & (img[:, :, 0] < 80)
+            yy, xx = np.nonzero(m)
+            sel = (np.abs(yy - y) < win) & (np.abs(xx - x) < win)
+            self.assertGreater(int(sel.sum()), 10)
+            return float(xx[sel].mean())
+
         far_chain = lm[JAW_LEFT_IDS]
+        near_chain = lm[JAW_RIGHT_IDS]
         fx = int(far_chain[:, 0].mean() * w)
         fy = int(far_chain[:, 1].mean() * h)
-        cv2.rectangle(frame, (fx - 4, fy - 4), (fx + 4, fy + 4), (0, 0, 255), -1)
+        nx = int(near_chain[:, 0].mean() * w)
+        ny = int(near_chain[:, 1].mean() * h)
+        for x, y in ((fx, fy), (nx, ny)):
+            cv2.rectangle(frame, (x - 4, y - 4), (x + 4, y + 4), (0, 0, 255), -1)
         out = slim_face(frame, lm, strength=1.0)
-        far_roi = np.s_[fy - 3:fy + 4, fx - 3:fx + 4]
-        self.assertTrue(np.array_equal(out[far_roi], frame[far_roi]))
+        far_shift = abs(marker_centroid(out, fx, fy) - fx)     # 朝中心（右）
+        near_shift = abs(nx - marker_centroid(out, nx, ny))    # 朝中心（左）
+        self.assertGreater(near_shift, 8.0)            # 近端明显内收
+        self.assertLess(far_shift, near_shift / 3.0)   # 远端被显著抑制
+
+    def test_slim_cheek_bulk_moves(self):
+        """脸颊主体（轮廓内侧 ~40px）应整体内收，而非只有贴线窄管在动。"""
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        h, w = frame.shape[:2]
+        chain = lm[JAW_LEFT_IDS]
+        cx = int(chain[:, 0].mean() * w)
+        cy = int(chain[:, 1].mean() * h)
+        # 沿"链中点 → 椭圆中心"方向内移 40px（脸颊内部）
+        ctr = np.array([w / 2, h / 2])
+        p = np.array([cx, cy], float)
+        d = 40.0 * (ctr - p) / np.linalg.norm(ctr - p)
+        probe_x, probe_y = int(p[0] + d[0]), int(p[1] + d[1])
+        cv2.rectangle(frame, (probe_x - 4, probe_y - 4),
+                      (probe_x + 4, probe_y + 4), (0, 0, 255), -1)
+        out = slim_face(frame, lm, strength=1.0)
+        m = (out[:, :, 2] > 200) & (out[:, :, 1] < 80) & (out[:, :, 0] < 80)
+        yy, xx = np.nonzero(m)
+        sel = (np.abs(yy - probe_y) < 90) & (np.abs(xx - probe_x) < 90)
+        self.assertGreater(int(sel.sum()), 10)
+        after = float(xx[sel].mean())
+        self.assertGreater(after, probe_x + 8.0)   # 明显向中心移动
 
     def test_slim_near_side_still_works(self):
         """侧脸时近端（真实轮廓一侧）仍正常内收。"""
