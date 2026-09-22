@@ -229,6 +229,11 @@ def process_image(path: str, engine: InferenceEngine, algos: list[str],
             lm = face.landmarks
             lm_px = lm[:, :2] * np.array([w, h])
             yaw = yaws[fi]
+            # 远端塌缩比（与 slim_face_controls 同口径），debug 观察用
+            nose_x = float(lm_px[1, 0])
+            c0 = abs(float(lm_px[JAW_LEFT_IDS, 0].mean()) - nose_x)
+            c1 = abs(float(lm_px[JAW_RIGHT_IDS, 0].mean()) - nose_x)
+            far_ratio = min(c0, c1) / max(c0, c1, 1e-3)
             gated = strength * pose_gate(yaw)   # 与 slim_face_maps 内部一致
             P, D, W, brush_r, mover_ids, guard_ids = slim_face_controls(
                 w, h, lm, gated, yaw)
@@ -253,7 +258,8 @@ def process_image(path: str, engine: InferenceEngine, algos: list[str],
                         [cv2.IMWRITE_JPEG_QUALITY, 92])
             report_metrics(f"{algo} f{fi}", map_x, map_y, lm_px, h, w)
             print(f"  输出: outputs/debug/{stem}{suffix}_*_({algo}).jpg  "
-                  f"(movers={len(mover_ids)} R={brush_r:.0f}px)")
+                  f"(movers={len(mover_ids)} R={brush_r:.0f}px "
+                  f"塌缩比={far_ratio:.2f})")
         if len(ctx.faces) > 1:
             cv2.imwrite(str(out_dir / f"{stem}_wipe_{algo}_s{tag}.jpg"),
                         wipe_compare(src, out),

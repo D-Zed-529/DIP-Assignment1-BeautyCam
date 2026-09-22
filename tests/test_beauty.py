@@ -325,7 +325,7 @@ class TestPoseGate(unittest.TestCase):
         # 左半压缩 35% → 远端在左，yaw 约 (1-0.65)/(1+0.65)*90 ≈ 19°
         lm = yawed_face_landmarks(frame, squeeze=0.35)
         yaw = estimate_yaw_deg(lm)
-        self.assertGreater(yaw, B.FAR_SIDE_SKIP_DEG)
+        self.assertGreater(yaw, 10.0)
         self.assertLess(yaw, B.YAW_ZERO_DEG)
 
     def test_pose_gate_ramp(self):
@@ -334,7 +334,7 @@ class TestPoseGate(unittest.TestCase):
         mid = (B.YAW_FULL_DEG + B.YAW_ZERO_DEG) / 2
         self.assertAlmostEqual(pose_gate(mid), 0.5, places=6)
         self.assertEqual(pose_gate(B.YAW_ZERO_DEG), 0.0)
-        self.assertEqual(pose_gate(80.0), 0.0)
+        self.assertEqual(pose_gate(90.0), 0.0)
 
     def test_slim_chin_also_lifted(self):
         """瘦脸时下巴尖也应上收（"下巴也瘦一点"），水平方向不外扩。"""
@@ -355,15 +355,13 @@ class TestPoseGate(unittest.TestCase):
         self.assertTrue(np.array_equal(out, frame))
 
     def test_slim_far_side_suppressed(self):
-        """侧脸（中等偏航）时远端（塌缩侧）位移远小于近端（真实轮廓侧）。
+        """侧脸（中重度偏航）时远端（塌缩侧）位移远小于近端（真实轮廓侧）。
 
-        远端链被跳过后，仅剩近端宽内侧场的跨中线残余影响——语义是
-        "远端不再被直接液化"，而非逐位不变。
+        远端链按塌缩比连续衰减后仍保留少量幅度（无硬切），仅剩近端
+        场的跨中线残余影响——语义是"远端不再被明显液化"，而非逐位不变。
         """
         frame = synth_face_frame()
         lm = yawed_face_landmarks(frame, squeeze=0.35)
-        yaw = estimate_yaw_deg(lm)
-        self.assertGreater(abs(yaw), B.FAR_SIDE_SKIP_DEG)
         h, w = frame.shape[:2]
 
         def marker_centroid(img, x, y, win=70):
@@ -387,6 +385,38 @@ class TestPoseGate(unittest.TestCase):
         near_shift = abs(nx - marker_centroid(out, nx, ny))    # 朝中心（左）
         self.assertGreater(near_shift, 8.0)            # 近端明显内收
         self.assertLess(far_shift, near_shift / 3.0)   # 远端被显著抑制
+
+    def test_slim_far_side_continuous_not_hard_cut(self):
+        """中度侧脸（squeeze=0.3，塌缩比 ≈0.7）远端应保留部分幅度。
+
+        回归"硬切"语义：旧版超过 15° 直接整条跳过远端链（跳变），
+        现版按塌缩比连续过渡——中度侧脸远端幅度应明显非零、且仍小于
+        近端（不对称收缩）。
+        """
+        frame = synth_face_frame()
+        lm = yawed_face_landmarks(frame, squeeze=0.30)
+        h, w = frame.shape[:2]
+
+        def marker_centroid(img, x, y, win=70):
+            m = (img[:, :, 2] > 200) & (img[:, :, 1] < 80) & (img[:, :, 0] < 80)
+            yy, xx = np.nonzero(m)
+            sel = (np.abs(yy - y) < win) & (np.abs(xx - x) < win)
+            self.assertGreater(int(sel.sum()), 10)
+            return float(xx[sel].mean())
+
+        far_chain = lm[JAW_LEFT_IDS]
+        near_chain = lm[JAW_RIGHT_IDS]
+        fx = int(far_chain[:, 0].mean() * w)
+        fy = int(far_chain[:, 1].mean() * h)
+        nx = int(near_chain[:, 0].mean() * w)
+        ny = int(near_chain[:, 1].mean() * h)
+        for x, y in ((fx, fy), (nx, ny)):
+            cv2.rectangle(frame, (x - 4, y - 4), (x + 4, y + 4), (0, 0, 255), -1)
+        out = slim_face(frame, lm, strength=1.0)
+        far_shift = abs(marker_centroid(out, fx, fy) - fx)
+        near_shift = abs(nx - marker_centroid(out, nx, ny))
+        self.assertGreater(far_shift, 1.5)             # 远端仍有作用（无硬切）
+        self.assertLess(far_shift, near_shift * 0.8)   # 但仍弱于近端
 
     def test_slim_cheek_bulk_moves(self):
         """脸颊主体（轮廓内侧 ~40px）应整体内收，而非只有贴线窄管在动。
