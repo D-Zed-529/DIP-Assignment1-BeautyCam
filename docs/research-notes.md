@@ -61,3 +61,18 @@
 | 超分 | — | Real-ESRGAN（或 ResShift） | 退化建模、扩散加速 |
 | 人脸 | — | GFPGAN / CodeFormer | 生成先验 |
 | 虚化/换背景 | MediaPipe 自拍分割 + Depth Anything | rembg(BiRefNet) | 分割 + 深度 |
+
+## 五、实机反馈驱动的补充调研：侧脸防伪影（2026-09，Phase 0 联调）
+
+**问题**：美颜的液化变形（瘦脸/大眼）在侧脸下产生拉扯伪影——2D 变形隐含正脸假设，头偏航后"远端"下颌链的 2D 投影塌缩进脸颊中部，变形带横穿脸面；大眼固定半径在透视缩短的远端眼上溢出到鼻梁。
+
+**参照**：
+- MediaPipe 官方头姿路线：FaceLandmarker 可输出 `facialTransformationMatrixes`（规范脸模型 → 运行时关键点的刚体变换），分解欧拉角得 yaw（[官方博客](https://developers.googleblog.com)、[Face Landmarker 文档](https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker)）。
+- [大偏航下关键点退化](https://pubmed.ncbi.nlm.nih.gov/23681991/)（Perakis et al.）与 [MLLS 图像变形](https://ar5iv.labs.arxiv.org)（Schaefer et al. 2006 系）是变形质量的两条经典线；工程通行做法是**按头姿给变形强度加门控**，超阈值直接关闭。
+
+**落地（`core/effects/beauty.py`）**：
+- `estimate_yaw_deg()`：鼻尖(1)到左右脸缘(234/454)的水平距离比 → 线性近似偏航角（无需变换矩阵，自动兼容镜像，只作门控阈值用）；
+- `pose_gate()`：|yaw| ≤15° 全强度，15°~32° 线性衰减，≥32° 关闭变形；
+- 瘦脸：|yaw| >12° 时跳过远端下颌链（远端 = 2D 质心更近鼻尖的塌缩侧，不依赖 yaw 符号）；
+- 大眼：半径 = 眼角距 × 0.85（自适应透视缩短，上限 0.045w），眼角距 <2%w 判为塌缩跳过该眼。
+- 性能：瘦脸距离场改为 `cv2.distanceTransform`（17.7ms → 5.4ms），美白限定掩膜包围盒；全链 720p 实测 ~28fps。

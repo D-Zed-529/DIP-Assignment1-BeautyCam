@@ -11,8 +11,8 @@ import cv2
 import numpy as np
 
 from core.effects.beauty import (
-    BeautyEffect, JAW_LEFT_IDS, JAW_RIGHT_IDS, enlarge_eyes, face_oval_mask,
-    get_skin_mask, slim_face, whitening,
+    BeautyEffect, JAW_LEFT_IDS, JAW_RIGHT_IDS, enlarge_eyes, estimate_yaw_deg,
+    face_oval_mask, get_skin_mask, pose_gate, slim_face, whitening,
 )
 from core.context import FaceInfo, FrameContext
 from core.infer import FACE_OVAL_IDS as OVAL_IDS
@@ -49,14 +49,32 @@ def synth_face_landmarks(frame: np.ndarray) -> np.ndarray:
     for i in range(468):
         if i not in reserved:
             lm[i] = cx / w, cy / h, 0.0
-    # 下颌两侧：左颊 x < 中心，右颊 x > 中心，y 在下半段
+    # 下颌两侧：左颊 x < 中心，右颊 x > 中心，y 在下半段（两侧各自长度）
+    ys_left = np.linspace(cy + ry * 0.55, cy + ry * 0.95, len(JAW_LEFT_IDS))
+    ys_right = np.linspace(cy + ry * 0.55, cy + ry * 0.95, len(JAW_RIGHT_IDS))
     left_xs = np.linspace(cx - rx, cx - rx * 0.2, len(JAW_LEFT_IDS))
     right_xs = np.linspace(cx + rx * 0.2, cx + rx, len(JAW_RIGHT_IDS))
-    ys = np.linspace(cy + ry * 0.55, cy + ry * 0.95, len(JAW_LEFT_IDS))
-    for idx, x, y in zip(JAW_LEFT_IDS, left_xs, ys):
+    for idx, x, y in zip(JAW_LEFT_IDS, left_xs, ys_left):
         lm[idx] = x / w, y / h, 0.0
-    for idx, x, y in zip(JAW_RIGHT_IDS, right_xs, ys):
+    for idx, x, y in zip(JAW_RIGHT_IDS, right_xs, ys_right):
         lm[idx] = x / w, y / h, 0.0
+    # 234/454 是真实左右脸缘点（estimate_yaw_deg 依赖）；454 同时是右链端点，
+    # 故此覆盖放在下颌循环之后，取对称位置
+    lm[234] = (cx - rx * 0.95) / w, (cy + ry * 0.3) / h, 0.0
+    lm[454] = (cx + rx * 0.95) / w, (cy + ry * 0.3) / h, 0.0
+    return lm
+
+
+def yawed_face_landmarks(frame: np.ndarray, squeeze: float) -> np.ndarray:
+    """模拟侧脸：把左半张脸的水平坐标向中线压缩（透视缩短）。
+
+    squeeze=0 完全不动；squeeze=0.35 表示左侧压缩 35%（左半为远端）。
+    同时作用于轮廓点与下颌链，保持几何一致。
+    """
+    lm = synth_face_landmarks(frame).copy()
+    cx = 0.5
+    left = lm[:, 0] < cx
+    lm[left, 0] = cx - (cx - lm[left, 0]) * (1.0 - squeeze)
     return lm
 
 
@@ -104,6 +122,16 @@ class TestFaceOvalMask(unittest.TestCase):
 
 
 class TestEnlargeEyes(unittest.TestCase):
+    def _spread_eyes(self, lm):
+        # 眼角保持间距（外角 0.45 / 内角 0.55），上下睑略偏移
+        for eye_ids in ((33, 133, 159, 145), (362, 263, 386, 374)):
+            outer, inner, top, bottom = eye_ids
+            lm[outer] = (0.45, 0.50, 0)
+            lm[inner] = (0.55, 0.50, 0)
+            lm[top] = (0.50, 0.48, 0)
+            lm[bottom] = (0.50, 0.52, 0)
+        return lm
+
     def test_zero_strength_identity(self):
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
@@ -112,16 +140,40 @@ class TestEnlargeEyes(unittest.TestCase):
 
     def test_enlarge_changes_eye_region_only(self):
         frame = synth_face_frame()
-        lm = synth_face_landmarks(frame)
-        for eye_ids in ((33, 133, 159, 145), (362, 263, 386, 374)):
-            for i in eye_ids:
-                lm[i, 0], lm[i, 1] = 0.5, 0.5
+        lm = self._spread_eyes(synth_face_landmarks(frame))
         out = enlarge_eyes(frame, lm, strength=0.3)
         h, w = frame.shape[:2]
         eye_roi = np.s_[h // 2 - 10:h // 2 + 10, w // 2 - 10:w // 2 + 10]
         self.assertFalse(np.array_equal(out[eye_roi], frame[eye_roi]))
         # 远离眼睛的区域不动
         self.assertTrue(np.array_equal(out[:40, :40], frame[:40, :40]))
+
+    def test_disabled_at_large_yaw(self):
+        frame = synth_face_frame()
+        lm = self._spread_eyes(synth_face_landmarks(frame))
+        out = enlarge_eyes(frame, lm, strength=0.3, yaw_deg=40.0)
+        self.assertTrue(np.array_equal(out, frame))
+
+    def test_squint_eye_skipped(self):
+        """透视塌缩的眼睛（眼角距过小）不做变形。"""
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        # 左眼中心 0.30、右眼中心 0.70，外角/内角各偏 0.05（正常间距）
+        for eye_ids, c in (((33, 133, 159, 145), 0.30),
+                           ((362, 263, 386, 374), 0.70)):
+            outer, inner, top, bottom = eye_ids
+            lm[outer] = (c - 0.05, 0.50, 0)
+            lm[inner] = (c + 0.05, 0.50, 0)
+            lm[top] = (c, 0.48, 0)
+            lm[bottom] = (c, 0.52, 0)
+        # 左眼外角贴到内角旁：眼角距 0.005 < 0.02，跳过该眼
+        lm[33] = (0.345, 0.50, 0)
+        out = enlarge_eyes(frame, lm, strength=0.4)
+        h, w = frame.shape[:2]
+        left_roi = np.s_[h // 2 - 8:h // 2 + 8, int(0.24 * w):int(0.36 * w)]
+        self.assertTrue(np.array_equal(out[left_roi], frame[left_roi]))
+        right_roi = np.s_[h // 2 - 8:h // 2 + 8, int(0.64 * w):int(0.76 * w)]
+        self.assertFalse(np.array_equal(out[right_roi], frame[right_roi]))
 
 
 class TestSlimFace(unittest.TestCase):
@@ -237,6 +289,72 @@ class TestBeautyEffect(unittest.TestCase):
         # 其余参数不受影响
         self.assertEqual(eff.get_params()["smooth"],
                          BeautyEffect.default_params()["smooth"])
+
+
+class TestPoseGate(unittest.TestCase):
+    """侧脸防伪影：头姿估计、门控与远端下颌链跳过。"""
+
+    def test_estimate_yaw_symmetric_zero(self):
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        self.assertAlmostEqual(estimate_yaw_deg(lm), 0.0, delta=2.0)
+
+    def test_estimate_yaw_asymmetric(self):
+        frame = synth_face_frame()
+        # 左半压缩 35% → 远端在左，yaw 约 (1-0.65)/(1+0.65)*90 ≈ 19°
+        lm = yawed_face_landmarks(frame, squeeze=0.35)
+        yaw = estimate_yaw_deg(lm)
+        self.assertGreater(yaw, 12.0)
+        self.assertLess(yaw, 32.0)
+
+    def test_pose_gate_ramp(self):
+        self.assertEqual(pose_gate(0.0), 1.0)
+        self.assertEqual(pose_gate(-15.0), 1.0)
+        self.assertAlmostEqual(pose_gate(23.5), 0.5, places=6)
+        self.assertEqual(pose_gate(32.0), 0.0)
+        self.assertEqual(pose_gate(80.0), 0.0)
+
+    def test_slim_disabled_at_large_yaw(self):
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        out = slim_face(frame, lm, strength=1.0, yaw_deg=40.0)
+        self.assertTrue(np.array_equal(out, frame))
+
+    def test_slim_far_side_skipped(self):
+        """侧脸（中等偏航）时远端（塌缩侧）下颌链不再被液化。"""
+        frame = synth_face_frame()
+        lm = yawed_face_landmarks(frame, squeeze=0.35)
+        yaw = estimate_yaw_deg(lm)
+        self.assertGreater(abs(yaw), 12.0)   # 触发远端跳过
+        h, w = frame.shape[:2]
+        # 在远端（左，塌缩侧）链中点放标记：应完全不动
+        far_chain = lm[JAW_LEFT_IDS]
+        fx = int(far_chain[:, 0].mean() * w)
+        fy = int(far_chain[:, 1].mean() * h)
+        cv2.rectangle(frame, (fx - 4, fy - 4), (fx + 4, fy + 4), (0, 0, 255), -1)
+        out = slim_face(frame, lm, strength=1.0)
+        far_roi = np.s_[fy - 3:fy + 4, fx - 3:fx + 4]
+        self.assertTrue(np.array_equal(out[far_roi], frame[far_roi]))
+
+    def test_slim_near_side_still_works(self):
+        """侧脸时近端（真实轮廓一侧）仍正常内收。"""
+        frame = synth_face_frame()
+        lm = yawed_face_landmarks(frame, squeeze=0.35)
+        h, w = frame.shape[:2]
+        near_chain = lm[JAW_RIGHT_IDS]
+        nx = int(near_chain[:, 0].mean() * w)
+        ny = int(near_chain[:, 1].mean() * h)
+        cv2.rectangle(frame, (nx - 4, ny - 4), (nx + 4, ny + 4), (0, 0, 255), -1)
+
+        def red_centroid(img):
+            m = (img[:, :, 2] > 200) & (img[:, :, 1] < 80) & (img[:, :, 0] < 80)
+            self.assertGreater(int(m.sum()), 10)
+            return float(np.nonzero(m)[1].mean())
+
+        before = red_centroid(frame)
+        out = slim_face(frame, lm, strength=1.0)
+        after = red_centroid(out)
+        self.assertLess(after, before - 1.0)   # 向左（中线方向）移动
 
 
 if __name__ == "__main__":

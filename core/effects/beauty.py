@@ -27,8 +27,18 @@ SMOOTH_SIGMA = 60          #双边滤波颜色/空间 sigma（一期口径）
 WHITEN_L_MAX = 30.0        # 美白滑杆上限（LAB L 增量；一期 15~18 推荐档）
 SLIM_MAX_SHIFT_RATIO = 0.025   # 瘦脸强度=1.0 时的最大水平位移（占帧宽比例）
 SLIM_BAND_SIGMA = 30.0     # 瘦脸影响域高斯衰减尺度（像素）
-EYE_RADIUS_RATIO = 0.045   # 大眼作用半径（占帧宽比例，一期口径）
+EYE_RADIUS_RATIO = 0.045   # 大眼作用半径（占帧宽比例，作半径上限兜底）
+EYE_RADIUS_FROM_CORNERS = 0.85   # 大眼半径 = 眼角距 × 系数（自适应透视缩短）
+EYE_MIN_CORNER_RATIO = 0.02      # 眼角距（归一化）低于此值视为透视塌缩，跳过该眼
 EYE_STRENGTH_MAX = 0.5     # 大眼滑杆上限（一期默认 0.18）
+
+# ------- 头姿门控（侧脸防伪影，实机反馈驱动） -------
+# 2D 液化变形隐含"正脸假设"：头偏航后远端下颌链的投影塌缩进脸颊中部，
+# 变形带会横穿脸面产生拉扯伪影。通行做法（MediaPipe 刚体变换头姿估计、
+# MLLS 变形文献）是按头姿给变形强度加门控，超阈值直接关闭。
+YAW_FULL_DEG = 15.0        # |yaw| ≤ 此值：变形全强度
+YAW_ZERO_DEG = 32.0        # |yaw| ≥ 此值：变形完全关闭
+FAR_SIDE_SKIP_DEG = 12.0   # |yaw| 超过此值：跳过"远端"下颌链（投影已塌缩）
 
 # 左/右眼关键点（外角、内角、上睑、下睑 —— 一期口径）
 LEFT_EYE_IDS = (33, 133, 159, 145)
@@ -39,6 +49,33 @@ RIGHT_EYE_IDS = (362, 263, 386, 374)
 # 鼻翼/脸颊内测区域，导致瘦脸变形跑到鼻子上（实机反馈已验证）。
 JAW_LEFT_IDS = [148, 176, 149, 150, 136, 172, 58, 132, 93]
 JAW_RIGHT_IDS = [377, 400, 378, 379, 365, 397, 288, 361, 323, 454]
+
+
+def estimate_yaw_deg(landmarks: np.ndarray) -> float:
+    """由关键点不对称度近似头姿偏航角（度）。
+
+    鼻尖(1) 到左右脸缘(234/454) 的水平距离比：正脸约 0，侧脸趋向 ±1，
+    乘 90° 线性近似。仅用于变形门控阈值判断（15°/32° 档），不需要
+    MediaPipe 变换矩阵的精确欧拉角；且自动兼容预览镜像。
+    """
+    nose = float(landmarks[1, 0])
+    d_left = abs(float(landmarks[234, 0]) - nose)
+    d_right = abs(float(landmarks[454, 0]) - nose)
+    if d_left + d_right < 1e-6:
+        return 0.0
+    return (d_right - d_left) / (d_right + d_left) * 90.0
+
+
+def pose_gate(yaw_deg: float,
+              full: float = YAW_FULL_DEG,
+              zero: float = YAW_ZERO_DEG) -> float:
+    """头姿门控系数：正脸全强度 → 侧脸线性衰减到 0。"""
+    a = abs(yaw_deg)
+    if a <= full:
+        return 1.0
+    if a >= zero:
+        return 0.0
+    return 1.0 - (a - full) / (zero - full)
 
 
 def get_skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
@@ -61,26 +98,58 @@ def face_oval_mask(frame_bgr: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
 
 
 def whitening(frame_bgr: np.ndarray, mask: np.ndarray, strength: float) -> np.ndarray:
-    """LAB 空间定向美白：美白量随掩膜置信度（0~255）渐变，避免二值硬边。"""
-    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
+    """LAB 空间定向美白：美白量随掩膜置信度（0~255）渐变，避免二值硬边。
+
+    只在掩膜包围盒内运算（盒外 alpha=0，输出严格不变，也省 LAB 全帧往返）。
+    """
+    ys_, xs_ = np.nonzero(mask)
+    if len(ys_) == 0:
+        return frame_bgr
+    y1, y2 = int(ys_.min()), int(ys_.max()) + 1
+    x1, x2 = int(xs_.min()), int(xs_.max()) + 1
+    crop = frame_bgr[y1:y2, x1:x2]
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    alpha = mask.astype(np.float32) / 255.0
+    alpha = mask[y1:y2, x1:x2].astype(np.float32) / 255.0
     l_new = np.clip(l_ch + strength * alpha, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(cv2.merge((l_new, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+    out = frame_bgr.copy()
+    out[y1:y2, x1:x2] = cv2.cvtColor(
+        cv2.merge((l_new, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+    return out
 
 
 def enlarge_eyes(frame_bgr: np.ndarray, landmarks: np.ndarray,
                  strength: float = 0.18,
-                 radius_ratio: float = EYE_RADIUS_RATIO) -> np.ndarray:
-    """大眼：双眼局部 remap 放大（向中心收缩采样），边缘羽化混合。"""
+                 radius_ratio: float = EYE_RADIUS_RATIO,
+                 yaw_deg: float | None = None) -> np.ndarray:
+    """大眼：双眼局部 remap 放大（向中心收缩采样），边缘羽化混合。
+
+    侧脸处理：
+      - 半径按该眼的眼角距自适应（远端眼透视缩短 → 半径同比缩小，
+        圆变形不再溢出到鼻梁/颧骨）；
+      - 头姿门控：yaw 超阈值时强度线性衰减到 0；
+      - 眼角距塌缩过小时直接跳过该眼（关键点在极端侧脸下不可信）。
+    """
+    if strength <= 0:
+        return frame_bgr
+    if yaw_deg is None:
+        yaw_deg = estimate_yaw_deg(landmarks)
+    strength = strength * pose_gate(yaw_deg)
     if strength <= 0:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
     out = frame_bgr.copy()
-    for eye_ids in (LEFT_EYE_IDS, RIGHT_EYE_IDS):
+    # 眼角对（外角/内角）：左眼 33-133，右眼 362-263
+    corner_pairs = {LEFT_EYE_IDS: (33, 133), RIGHT_EYE_IDS: (362, 263)}
+    for eye_ids, (c_out, c_in) in corner_pairs.items():
         cx = float(np.mean(landmarks[list(eye_ids), 0]) * w)
         cy = float(np.mean(landmarks[list(eye_ids), 1]) * h)
-        r = int(radius_ratio * w)
+        corner_dist = abs(float(landmarks[c_out, 0]) - float(landmarks[c_in, 0]))
+        if corner_dist < EYE_MIN_CORNER_RATIO:
+            continue          # 该眼透视塌缩（极端侧脸），跳过
+        # 自适应半径：眼角距 × 系数，并以上限兜底
+        r = int(min(EYE_RADIUS_FROM_CORNERS * corner_dist * w,
+                    radius_ratio * w))
         if r < 4:
             continue
         x1, x2 = max(int(cx - r), 0), min(int(cx + r), w)
@@ -104,13 +173,26 @@ def enlarge_eyes(frame_bgr: np.ndarray, landmarks: np.ndarray,
 
 
 def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
-              strength: float = 0.35) -> np.ndarray:
+              strength: float = 0.35,
+              yaw_deg: float | None = None) -> np.ndarray:
     """瘦脸：下颌两侧带状区域向脸中心收缩（liquify，remap 实现）。
 
     方向语义（曾实现反过）：remap 的采样坐标取"更靠脸外侧"的像素，
     即内容向中心移动 => 轮廓内收（瘦）；若采样坐标朝中心收缩则是放大
     （大眼正是利用这一点），会把鼻脸撑宽。
+
+    侧脸防伪影：
+      - 头姿门控：|yaw| 从 15° 起线性衰减，32° 起完全关闭；
+      - |yaw| > 12° 时跳过"远端"下颌链——头转过去后远端链在 2D 投影上
+        塌缩进脸颊中部（不再是真的轮廓），沿它液化会横穿脸面拉出伪影。
+        远端判定不看 yaw 符号（免受镜像/左右习惯干扰），直接比较两条链
+        的 2D 质心谁离鼻尖更近。
     """
+    if strength <= 0:
+        return frame_bgr
+    if yaw_deg is None:
+        yaw_deg = estimate_yaw_deg(landmarks)
+    strength = strength * pose_gate(yaw_deg)
     if strength <= 0:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
@@ -119,7 +201,12 @@ def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
     out = frame_bgr.copy()
     max_shift = strength * SLIM_MAX_SHIFT_RATIO * w
     margin = int(SLIM_BAND_SIGMA * 3)
-    for side_ids in (JAW_LEFT_IDS, JAW_RIGHT_IDS):
+    chains = [JAW_LEFT_IDS, JAW_RIGHT_IDS]
+    if abs(yaw_deg) > FAR_SIDE_SKIP_DEG:
+        # 远端链 = 2D 质心更靠近鼻尖的那条（投影塌缩方）
+        chains.sort(key=lambda ids: abs(float(lm_px[ids, 0].mean()) - nose_x))
+        chains = chains[1:]     # 跳过最靠近鼻尖的一条
+    for side_ids in chains:
         pts = lm_px[side_ids]
         y0 = int(max(pts[:, 1].min() - margin, 0))
         y1 = int(min(pts[:, 1].max() + margin, h))
@@ -127,18 +214,21 @@ def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
         x_hi = int(min(pts[:, 0].max() + margin, w))
         if x_hi - x_lo < 8 or y1 - y0 < 8:
             continue
-        xs, ys = np.meshgrid(
-            np.arange(x_lo, x_hi, dtype=np.float32),
-            np.arange(y0, y1, dtype=np.float32))
-        # 到最近下颌链点的距离 -> 高斯衰减影响域（沿轮廓的带状管道）
-        d2 = (xs[..., None] - pts[:, 0]) ** 2 + (ys[..., None] - pts[:, 1]) ** 2
-        dist = np.sqrt(d2.min(axis=-1))
-        w_band = np.exp(-(dist / SLIM_BAND_SIGMA) ** 2)
+        # 到下颌链折线的最短距离场：ROI 内画 1px 链线 + 距离变换
+        # （比逐像素×链点的广播计算快一个量级，且距离对象是折线而非离散点。
+        #   注意不能用 LINE_AA：抗锯齿值 <255 会让"补图"没有零像素，DT 失效）
+        line = np.zeros((y1 - y0, x_hi - x_lo), np.uint8)
+        cv2.polylines(line, [(pts - [x_lo, y0]).astype(np.int32)], False, 255, 1)
+        line = cv2.threshold(line, 127, 255, cv2.THRESH_BINARY)[1]
+        dist = cv2.distanceTransform(255 - line, cv2.DIST_L2, 3)
+        w_band = np.exp(-(dist / SLIM_BAND_SIGMA) ** 2).astype(np.float32)
         # 从"更靠外侧"的位置采样 => 内容向脸中心移动（内收）
+        xs = np.arange(x_lo, x_hi, dtype=np.float32)[None, :]
         outward = np.sign(xs - nose_x)
         shift = outward * (max_shift * w_band)
         map_x = (xs + shift).astype(np.float32)
-        roi = cv2.remap(frame_bgr, map_x, ys.astype(np.float32),
+        ys = np.arange(y0, y1, dtype=np.float32)[:, None] * np.ones_like(map_x)
+        roi = cv2.remap(frame_bgr, map_x, ys,
                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         # 按 w_band 混合写入：远离本链的区域保持 out 原样。左右链的 ROI
         # 在下巴处重叠，硬切 ROI 会让后处理一侧的近恒等场覆盖掉先处理
@@ -192,11 +282,13 @@ class BeautyEffect(Effect):
         if not ctx.faces:
             return frame
 
-        # 3. 瘦脸 / 大眼（逐脸，需关键点）
+        # 3. 瘦脸 / 大眼（逐脸，需关键点；侧脸按头姿门控防伪影）
         for f in ctx.faces:
-            frame = slim_face(frame, f.landmarks, p["slim"])
+            yaw = estimate_yaw_deg(f.landmarks)
+            frame = slim_face(frame, f.landmarks, p["slim"], yaw_deg=yaw)
             if p["eye_enabled"] and p["eye_strength"] > 0:
-                frame = enlarge_eyes(frame, f.landmarks, p["eye_strength"])
+                frame = enlarge_eyes(frame, f.landmarks, p["eye_strength"],
+                                     yaw_deg=yaw)
 
         # 4. 收尾：轻去噪 + 锐化防糊（一期口径）
         frame = cv2.medianBlur(frame, 3)
