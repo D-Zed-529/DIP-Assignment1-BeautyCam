@@ -24,3 +24,9 @@ models/
 # IDE
 .idea/
 .vscode/
+
+# MediaPipe Tasks 模型
+*.task
+
+# headless 批跑输出
+outputs/

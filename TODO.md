@@ -5,20 +5,20 @@
 
 ## Phase 0 — 重构底座（6–9 人日）
 
-- [ ] **P0-1** 冒烟验证：用 `.venv`（mediapipe 1.0.1）跑一遍 `beautycam_v1.py`，确认 `mp.solutions.*` 旧 API 是否兼容；不兼容则记录差异，`core/infer.py` 改用新 Tasks API 封装（0.25d）
-- [ ] **P0-2** 建目录骨架：`core/{effects}`、`gui/`、`demos/`、`scripts/`、`tests/`、`assets/`、`legacy/`（0.5d）
-- [ ] **P0-3** `core/camera.py`：采集源抽象（实时相机 / 视频文件 / 图片序列），固定 1280×720、镜像、弱光检测口径统一（0.5d）
-- [ ] **P0-4** `core/pipeline.py` + `core/context.py`：Effect 基类（`name/enabled/params/process`）、FrameContext（共享推理结果）、线程安全 `set_params()`（1d）
-- [ ] **P0-5** `core/infer.py`：MediaPipe 单例会话；每帧统一跑 FaceMesh/Hands/FaceDetection 填充 ctx（0.5d）
-- [ ] **P0-6** `core/effects/beauty.py`：迁移磨皮/美白/瘦脸/大眼，全部参数化（磨皮混合比、美白强度、瘦脸度、大眼开关+强度）（1d）
-- [ ] **P0-7** `gui/main_window.py`：PySide6 主窗口——视频区 / 效果控制面板 / 拍照预览条；`theme.qss` 暗色主题（1.5d）
-- [ ] **P0-8** `gui/workers.py`：QThread 相机工作线程，信号发帧（ndarray）；主线程绘制；杜绝跨线程碰控件（1d）
-- [ ] **P0-9** 拍照功能迁移：手动拍照 / V 手势 / 笑脸触发（**顺带修复一期 `global` 缺失与双线程启动 bug**）、快门音效、`photos/` 预览条点击放大（1d）
-- [ ] **P0-10** `scripts/run_pipeline.py`：headless CLI，对图片目录/视频批跑管线并保存输出（评测数据生产线）（0.5d）
-- [ ] **P0-11** `tests/`：美颜纯函数、V 手势判定、笑脸判定的单测（静态图，不依赖摄像头）（0.5d）
-- [ ] **P0-12** `requirements.txt` 增加 PySide6；`beautycam_v1.py` 移入 `legacy/`；更新 README（0.25d）
+- [x] **P0-1** 冒烟验证：mediapipe **1.0.1 不可用**（移除 `mp.solutions` + Tasks 检测类图 Metal 崩溃），锁定 **0.10.21** + Tasks API + 显式 CPU 委托；FaceDetector 弃用（人脸框由 FaceMesh 导出）。结论固化在 `core/infer.py` 模块头与 README（0.25d）
+- [x] **P0-2** 建目录骨架：`core/{effects}`、`gui/`、`demos/`、`scripts/`、`tests/`、`assets/`、`legacy/`（0.5d）
+- [x] **P0-3** `core/camera.py`：采集源抽象（实时相机 / 视频文件 / 图片序列），固定 1280×720、镜像、弱光检测口径统一（0.5d）
+- [x] **P0-4** `core/pipeline.py` + `core/context.py`：Effect 基类（`name/enabled/params/process`）、FrameContext（共享推理结果）、线程安全 `set_params()`（整字典替换快照）（1d）
+- [x] **P0-5** `core/infer.py`：Tasks API 单例会话；每帧统一跑 FaceMesh(+blendshapes)/Hands/分割填充 ctx（0.5d）
+- [x] **P0-6** `core/effects/beauty.py`：磨皮/美白/瘦脸/大眼全部参数化；瘦脸改真 liquify 变形、大眼 remap 向量化（1d）
+- [x] **P0-7** `gui/main_window.py` + `panels.py`：PySide6 主窗口——视频区 / 效果控制面板 / 拍照预览条；`theme.qss` 暗色主题（1.5d）
+- [x] **P0-8** `gui/workers.py`：QThread 相机工作线程，信号发帧；杜绝跨线程碰控件（1d）
+- [x] **P0-9** 拍照功能迁移：手动 / V 手势（时间持续判定替代帧计数）/ 笑脸（blendshapes 置信度 + 回退口径）、快门音效、预览条点击放大；**一期 `global` 缺失与双线程 bug 已根治**（待摄像头实机联测确认）（1d）
+- [x] **P0-10** `scripts/run_pipeline.py`：headless CLI（图片目录/视频批跑，真图实测通过）+ `scripts/download_models.py`（0.5d）
+- [x] **P0-11** `tests/`：44 个单测全绿——美颜纯函数 / V 手势 / 笑脸 / 自动拍照状态机 / 管线顺序与并发参数 / 采集源 / 推理引擎（0.5d）
+- [x] **P0-12** `requirements.txt` 更新（锁 mediapipe 0.10.21 + PySide6）；`beautycam_v1.py` 移入 `legacy/`；README 重写（0.25d）
 
-**Phase 0 验收**：仅美颜链实时预览 ≥30fps；手势/笑脸/手动拍照全部可用；headless CLI 可出图；单测通过。
+**Phase 0 验收**：仅美颜链实测 ~55fps（M4/720p，含推理）≥30fps ✓；headless CLI 可出图 ✓；单测 44/44 ✓；手势/笑脸/手动拍照需用户实机运行确认（GUI + 摄像头无法无头验证）。
 
 ## Phase 1 — 自动 HDR（2–4 人日）
 

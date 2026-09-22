@@ -1,0 +1,89 @@
+"""拉取模型权重到 models/（models/ 不入库）。
+
+用法：python scripts/download_models.py [--force]
+
+P0-1 实测可用的下载源（mediapipe-models 官方桶部分路径已 404，以下为
+2026-09 实测可用地址；如再失效，按文件名到 MediaPipe 官方文档找新版本）。
+Phase 2 的低光增强 ONNX 权重（SCI / Zero-DCE++）定版后追加到 MANIFEST。
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+import urllib.request
+from pathlib import Path
+
+MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+
+# (文件名, 下载地址, 期望字节数——用于完整性校验，0 表示跳过)
+MANIFEST: list[tuple[str, str, int]] = [
+    ("face_landmarker.task",
+     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+     "face_landmarker/float16/1/face_landmarker.task",
+     3_758_596),
+    ("hand_landmarker.task",
+     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+     "hand_landmarker/float16/1/hand_landmarker.task",
+     7_819_105),
+    ("blaze_face_short_range.tflite",
+     "https://storage.googleapis.com/mediapipe-models/face_detector/"
+     "blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+     229_746),
+    ("selfie_multiclass_256x256.tflite",
+     "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+     "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
+     16_371_837),
+]
+
+CHUNK = 1 << 20   # 1 MiB
+
+
+def download(name: str, url: str, expect_size: int, force: bool) -> bool:
+    dest = MODELS_DIR / name
+    if dest.exists() and not force:
+        print(f"[跳过] {name} 已存在（{dest.stat().st_size} 字节）")
+        return True
+    print(f"[下载] {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp, \
+                open(dest, "wb") as f:
+            sha = hashlib.sha256()
+            got = 0
+            while True:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                sha.update(chunk)
+                got += len(chunk)
+                print(f"\r  {name}: {got / 1e6:.1f} MB", end="", flush=True)
+        print()
+    except Exception as exc:  # noqa: BLE001 —— 单个模型失败不阻塞其余
+        print(f"\n[失败] {name}: {exc}")
+        dest.unlink(missing_ok=True)
+        return False
+    if expect_size and got != expect_size:
+        print(f"[警告] {name} 大小 {got} != 期望 {expect_size}，请核对版本")
+    print(f"[完成] {name}（sha256 {sha.hexdigest()[:16]}…）")
+    return True
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--force", action="store_true", help="已存在也重新下载")
+    args = parser.parse_args()
+
+    MODELS_DIR.mkdir(exist_ok=True)
+    failures = [name for name, url, size in MANIFEST
+                if not download(name, url, size, args.force)]
+    if failures:
+        print(f"\n以下模型下载失败：{failures}", file=sys.stderr)
+        return 1
+    print("\n全部模型就绪。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
