@@ -12,6 +12,12 @@ env/
 # 运行时产物（照片输出目录）
 photos/
 
+# 模型权重（体积大，由 scripts/download_models.py 拉取）
+models/
+*.onnx
+*.pth
+*.tflite
+
 # 大文件：141MB 的答辩 PPT 超过 GitHub 100MB 单文件限制，不入库
 *.pptx
 

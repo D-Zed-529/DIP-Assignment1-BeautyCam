@@ -15,11 +15,14 @@
 
 ## 代码约定
 
-- 单文件脚本风格（`beautycam_v1.py`），若拆分模块，保持模块名小写下划线（如 `beauty.py`、`gestures.py`）。
+- **v2 架构（正在重构，见 `docs/PLAN.md`）**：`core/`（处理核心）与 `gui/`（PySide6 界面）严格分层——**`core/` 下任何模块禁止 import GUI 库**（PySide6/tkinter）；换脸等演示放 `demos/`；评测批跑走 `scripts/run_pipeline.py`（headless，不依赖 GUI）。
+- 效果插件模式：每个效果是 `core/effects/` 下的一个模块，实现 Effect 基类（`name/enabled/params/process(frame, ctx)`）；每帧推理结果统一放在 `FrameContext` 里共享，**效果内部禁止重复起 MediaPipe/ONNX 会话**。
+- 模块名小写下划线（如 `beauty.py`、`lowlight.py`）。
 - OpenCV 处理链以 BGR 帧为主，送入 MediaPipe 前转 RGB，注意别搞反。
-- MediaPipe solution 实例（`face_mesh` / `hands` / `face_detect`）是全局单例、创建开销大，不要在帧循环里重复创建。
-- 阈值 / 强度等调参常量集中在文件顶部定义并附中文注释（现有风格：`V_SIGN_HOLD`、`SMILE_HOLD` 等）。
-- GUI 是 Tkinter 主线程 + 相机子线程：子线程不能直接碰 Tk 控件，必须走 `root.after(0, ...)` 回调（参考 `update_camera` 末尾的用法）。
+- MediaPipe / ONNX 会话统一在 `core/infer.py` 管理单例、创建开销大，不要在帧循环里重复创建；ONNX 会话创建后必须记录并打印实际 execution provider（防 CoreML 静默回退 CPU）。
+- 阈值 / 强度等调参常量集中在模块顶部定义并附中文注释（现有风格：`V_SIGN_HOLD`、`SMILE_HOLD` 等）。
+- GUI 线程模型（PySide6）：相机与推理在 `gui/workers.py` 的 QThread 中，**工作线程永不触碰控件**，帧经信号 emit 到主线程绘制；参数更新走 `pipeline.set_params()`（内部加锁）。
+- 旧版 `beautycam_v1.py`（Tkinter）Phase 0 完成后移入 `legacy/`，只作参考不再维护。
 
 ## 已知坑（改代码前必读）
 
@@ -27,11 +30,13 @@
 2. `open_camera()` 启动了两次 `update_camera` 线程。
 3. `photos/` 是运行时输出目录，入库时忽略。
 4. `课程答辩PPT`（141MB）被 .gitignore 排除，超过 GitHub 100MB 限制，不要 `git add -f`。
+5. `models/`（ONNX 权重）不入库，由 `scripts/download_models.py` 拉取；也不要把权重文件放在 `models/` 以外的地方。
 
 ## Git 约定
 
-- 分支：`main`。提交信息用中文、一行式，说清「改了什么 + 为什么」。
-- 不提交 `.venv/`、`photos/`、`*.pptx`、`.DS_Store`。
+- 分支：`main` + 按阶段建功能分支（如 `feat/phase0-skeleton`、`feat/hdr`），完成自测后合回 `main`。
+- 提交信息用中文、一行式，说清「改了什么 + 为什么」。
+- 不提交 `.venv/`、`photos/`、`models/`、`*.pptx`、`.DS_Store`、`__pycache__/`。
 
 ## 验证方式
 

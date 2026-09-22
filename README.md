@@ -19,9 +19,12 @@
 
 ```
 .
-├── beautycam_v1.py   # 主程序（采集 → 检测 → 美颜 → 触发拍照 → GUI）
-├── 课程答辩PPT           # 答辩 PPT（141MB，不入库，见 .gitignore）
-├── README.md
+├── beautycam_v1.py   # 一期主程序（采集 → 检测 → 美颜 → 触发拍照 → GUI，重构后移入 legacy/）
+├── 课程答辩PPT           # 一期答辩 PPT（141MB，不入库，见 .gitignore）
+├── TODO.md            # 二期详细任务清单（分阶段 + 人日估算）
+├── docs/
+│   ├── PLAN.md        # 二期开发计划（架构 / 技术栈 / 阶段验收 / 风险）
+│   └── research-notes.md  # 选型调研
 ├── AGENTS.md          # AI 协作规范
 └── photos/            # 运行时照片输出（不入库）
 ```
@@ -51,9 +54,16 @@ python beautycam_v1.py
 - `update_camera()` 中 `v_sign_frames`、`smile_start_time` 存在赋值但未列入 `global` 声明，检测到手势 / 笑脸时会触发 `UnboundLocalError`（被 try/except 吞掉），表现为自动拍照可能失效。
 - `open_camera()` 中相机更新线程被启动了两次。
 
-## 路线图（二期候选功能）
+## 二期计划（已定稿）
 
-- 自动 HDR（多帧曝光融合，Mertens / 深学习方法）
-- 深度学习低光增强、超分辨率拍照、人脸修复
-- 人像分割 / 背景替换、景深虚化
-- 美颜强度滑杆、滤镜 LUT
+v2 定位为**多效果实时相机系统**，详见 [docs/PLAN.md](docs/PLAN.md) 与 [TODO.md](TODO.md)：
+
+- **自动 HDR 拍照**：gamma 模拟包围曝光 + Mertens 融合（经典线），可选单帧深度 HDR 对比线
+- **低光增强**：SCI / Zero-DCE++（ONNX，CoreML EP）替换现有启发式增强
+- **人像虚化 / 背景替换**：自拍分割起步，进阶深度渐进虚化
+- **实时美颜**：一期功能迁移并参数化
+- **换脸（演示级）**：Delaunay 剖分 + 泊松融合，主打过程可视化；仅限本人/授权/动漫形象
+- **GPU 加速**：ONNX Runtime CoreML EP + 性能对比基准
+- **GUI 全面重写**：Tkinter → PySide6（暗色主题、效果控制面板、信号槽线程模型）
+
+技术栈决策与架构设计（core/gui 分层、效果链、QThread 线程模型）见 PLAN §2–§3。
