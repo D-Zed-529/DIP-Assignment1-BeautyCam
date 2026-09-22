@@ -59,15 +59,23 @@ class BeautyPanel(QGroupBox):
                                  self._set("smooth")), 1, 0, 1, 3)
         grid.addWidget(SliderRow("美白", 0.0, 30.0, p["whiten"],
                                  self._set("whiten"), scale=1.0), 2, 0, 1, 3)
+        self.chk_face_only = QCheckBox("美白仅限脸部")
+        self.chk_face_only.setChecked(p["whiten_scope"] == "face")
+        self.chk_face_only.setToolTip(
+            "默认全身肤色美白（含脖子/手臂等皮肤）；勾选后仅脸部（一期口径）")
+        self.chk_face_only.toggled.connect(
+            lambda on: self.pipeline.set_params(
+                "beauty", whiten_scope="face" if on else "skin"))
+        grid.addWidget(self.chk_face_only, 3, 0, 1, 3)
         grid.addWidget(SliderRow("瘦脸", 0.0, 1.0, p["slim"],
-                                 self._set("slim")), 3, 0, 1, 3)
+                                 self._set("slim")), 4, 0, 1, 3)
 
         self.chk_eye = QCheckBox("大眼")
         self.chk_eye.setChecked(p["eye_enabled"])
         self.chk_eye.toggled.connect(self._set("eye_enabled"))
-        grid.addWidget(self.chk_eye, 4, 0)
+        grid.addWidget(self.chk_eye, 5, 0)
         grid.addWidget(SliderRow("大眼强度", 0.0, 0.5, p["eye_strength"],
-                                 self._set("eye_strength")), 4, 1, 1, 2)
+                                 self._set("eye_strength")), 5, 1, 1, 2)
 
     def _set(self, key: str):
         return lambda v: self.pipeline.set_params("beauty", **{key: v})

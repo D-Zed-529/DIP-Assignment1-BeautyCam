@@ -132,17 +132,70 @@ class TestSlimFace(unittest.TestCase):
         self.assertTrue(np.array_equal(out, frame))
 
     def test_slim_pulls_jaw_toward_center(self):
+        """方向回归：左下颌处的标记块应向脸中心（右）移动，而非外扩。
+
+        标记经 alpha 混合后不再是纯绿，按"绿色主导"检测（G 高、R/B 低）。
+        """
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        h, w = frame.shape[:2]
+        # 在左下颌链中点放一个纯绿标记块
+        chain = lm[JAW_LEFT_IDS]
+        mx = int(chain[:, 0].mean() * w)
+        my = int(chain[:, 1].mean() * h)
+        cv2.rectangle(frame, (mx - 4, my - 4), (mx + 4, my + 4), (0, 255, 0), -1)
+
+        def marker_centroid(img):
+            m = (img[:, :, 1] > 200) & (img[:, :, 0] < 80) & (img[:, :, 2] < 80)
+            self.assertGreater(int(m.sum()), 20)   # 标记可检出
+            return float(np.nonzero(m)[1].mean())
+
+        before = marker_centroid(frame)
+        out = slim_face(frame, lm, strength=1.0)
+        after = marker_centroid(out)
+        self.assertGreater(after, before + 3.0)   # 明显右移（内收）
+
+    def test_slim_leaves_forehead_untouched(self):
+        """瘦脸作用域限定在下颌带，额头/头顶不应被位移。"""
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
         out = slim_face(frame, lm, strength=1.0)
-        h, w = frame.shape[:2]
-        left_jaw = lm[JAW_LEFT_IDS]
-        y_probe = int(left_jaw[:, 1].mean() * h)
-        x_probe = int(left_jaw[:, 0].mean() * w)
-        jaw_roi = np.s_[y_probe - 3:y_probe + 3, x_probe - 3:x_probe + 3]
-        self.assertFalse(np.array_equal(out[jaw_roi], frame[jaw_roi]))
-        # 图像顶部远端不变
-        self.assertTrue(np.array_equal(out[:30, :30], frame[:30, :30]))
+        h = frame.shape[0]
+        top = np.s_[:int(h * 0.45), :]   # 头顶区（下颌带之上）
+        self.assertTrue(np.array_equal(out[top], frame[top]))
+
+
+class TestWhitenScope(unittest.TestCase):
+    """美白范围：默认全身肤色；whiten_scope=face 时才限定脸部。"""
+
+    def _frame_with_body_skin(self):
+        frame = synth_face_frame()
+        # 左侧背景铺一块纯"身体皮肤"色（模拟脖子/手臂），远离脸部椭圆
+        frame[:, :60] = np.uint8(SKIN_BGR)
+        return frame
+
+    def test_default_scope_whitens_body_skin(self):
+        frame = self._frame_with_body_skin()
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0})
+        ctx = FrameContext(width=frame.shape[1], height=frame.shape[0])  # 无脸
+        out = eff.process(frame.copy(), ctx)
+        before = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[:, 5:55].mean()
+        after = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)[:, 5:55].mean()
+        self.assertGreater(after, before + 3.0)
+
+    def test_face_scope_leaves_body_skin(self):
+        frame = self._frame_with_body_skin()
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0,
+                                   "whiten_scope": "face"})
+        lm = synth_face_landmarks(frame)
+        ctx = FrameContext(width=frame.shape[1], height=frame.shape[0],
+                           faces=[FaceInfo(landmarks=lm, box=(0.3, 0.2, 0.7, 0.8))])
+        out = eff.process(frame.copy(), ctx)
+        # 身体皮肤区域（取内部，避开边缘与收尾锐化的边界行）亮度不变
+        body = np.s_[5:-5, 5:55]
+        before = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[body].mean()
+        after = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)[body].mean()
+        self.assertAlmostEqual(after, before, delta=1.0)
 
 
 class TestBeautyEffect(unittest.TestCase):

@@ -4,7 +4,9 @@
   - 大眼：一期为逐像素 Python 双重循环（~3 万次/帧），v2 用局部 cv2.remap
     向量化并加边缘羽化，消除圆形硬边。
   - 瘦脸：一期只是在下颌点位画 1px 黑点（实际无变形效果），v2 实现为
-    下颌带状区域的 liquify 平移（朝脸中心，距离轮廓高斯衰减）。
+    下颌带状区域的 liquify 内收（采样朝脸外侧、内容向中心移动）。
+  - 美白：默认全身肤色（含脖子/手臂），可用 whiten_scope="face" 退回
+    一期"仅脸部"口径；美白量随掩膜置信度渐变（软 alpha，无二值硬边）。
   - 美白掩膜：一期用 FaceDetection 框 + FaceMesh 轮廓双限制；v2 弃用
     FaceDetector（macOS Tasks 版崩溃，见 core/infer.py），仅用 FaceMesh
     轮廓多边形掩膜，语义等价且少一次前向。
@@ -32,9 +34,11 @@ EYE_STRENGTH_MAX = 0.5     # 大眼滑杆上限（一期默认 0.18）
 LEFT_EYE_IDS = (33, 133, 159, 145)
 RIGHT_EYE_IDS = (362, 263, 386, 374)
 
-# 下颌轮廓左右各 10 点（一期口径）
-JAW_LEFT_IDS = list(range(234, 244))
-JAW_RIGHT_IDS = list(range(454, 464))
+# 下颌链（取自 FACE_OVAL 轮廓序的下半段，下巴 152 两侧）。
+# 注意：一期 range(234,244)/range(454,464) 并不在标准轮廓序上，会覆盖到
+# 鼻翼/脸颊内测区域，导致瘦脸变形跑到鼻子上（实机反馈已验证）。
+JAW_LEFT_IDS = [148, 176, 149, 150, 136, 172, 58, 132, 93]
+JAW_RIGHT_IDS = [377, 400, 378, 379, 365, 397, 288, 361, 323, 454]
 
 
 def get_skin_mask(frame_bgr: np.ndarray) -> np.ndarray:
@@ -57,11 +61,11 @@ def face_oval_mask(frame_bgr: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
 
 
 def whitening(frame_bgr: np.ndarray, mask: np.ndarray, strength: float) -> np.ndarray:
-    """LAB 空间定向美白：仅 mask 区域提升 L 通道。"""
+    """LAB 空间定向美白：美白量随掩膜置信度（0~255）渐变，避免二值硬边。"""
     lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
-    l_white = np.clip(l_ch.astype(np.int16) + strength, 0, 255).astype(np.uint8)
-    l_new = np.where(mask > 0, l_white, l_ch)
+    alpha = mask.astype(np.float32) / 255.0
+    l_new = np.clip(l_ch + strength * alpha, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge((l_new, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
 
 
@@ -101,38 +105,48 @@ def enlarge_eyes(frame_bgr: np.ndarray, landmarks: np.ndarray,
 
 def slim_face(frame_bgr: np.ndarray, landmarks: np.ndarray,
               strength: float = 0.35) -> np.ndarray:
-    """瘦脸：下颌两侧带状区域像素朝脸中心水平平移（liquify，remap 实现）。"""
+    """瘦脸：下颌两侧带状区域向脸中心收缩（liquify，remap 实现）。
+
+    方向语义（曾实现反过）：remap 的采样坐标取"更靠脸外侧"的像素，
+    即内容向中心移动 => 轮廓内收（瘦）；若采样坐标朝中心收缩则是放大
+    （大眼正是利用这一点），会把鼻脸撑宽。
+    """
     if strength <= 0:
         return frame_bgr
     h, w = frame_bgr.shape[:2]
     lm_px = landmarks[:, :2] * np.array([w, h], dtype=np.float32)
-    nose_x = float(lm_px[1, 0])   # 鼻尖 x 作为脸中心参考（比一期 w//2 稳）
+    nose_x = float(lm_px[1, 0])   # 鼻尖 x 作为脸中心参考
     out = frame_bgr.copy()
     max_shift = strength * SLIM_MAX_SHIFT_RATIO * w
+    margin = int(SLIM_BAND_SIGMA * 3)
     for side_ids in (JAW_LEFT_IDS, JAW_RIGHT_IDS):
         pts = lm_px[side_ids]
-        y0 = int(max(pts[:, 1].min() - 6, 0))
-        y1 = int(min(pts[:, 1].max() + 6, h))
-        x_lo = int(max(pts[:, 0].min() - 24, 0))
-        x_hi = int(min(pts[:, 0].max() + 24, w))
+        y0 = int(max(pts[:, 1].min() - margin, 0))
+        y1 = int(min(pts[:, 1].max() + margin, h))
+        x_lo = int(max(pts[:, 0].min() - margin, 0))
+        x_hi = int(min(pts[:, 0].max() + margin, w))
         if x_hi - x_lo < 8 or y1 - y0 < 8:
             continue
         xs, ys = np.meshgrid(
             np.arange(x_lo, x_hi, dtype=np.float32),
             np.arange(y0, y1, dtype=np.float32))
-        # 到最近轮廓点距离 -> 高斯衰减影响域（近似带状）
+        # 到最近下颌链点的距离 -> 高斯衰减影响域（沿轮廓的带状管道）
         d2 = (xs[..., None] - pts[:, 0]) ** 2 + (ys[..., None] - pts[:, 1]) ** 2
         dist = np.sqrt(d2.min(axis=-1))
         w_band = np.exp(-(dist / SLIM_BAND_SIGMA) ** 2)
-        # 竖直窗：下颌中段位移最大，向上下衰减（脸颊上部不动）
-        t = (ys - ys.min()) / max(ys.max() - ys.min(), 1.0)
-        v_win = np.exp(-((t - 0.65) / 0.30) ** 2)
-        shift = np.sign(nose_x - xs) * (max_shift * w_band * v_win)
+        # 从"更靠外侧"的位置采样 => 内容向脸中心移动（内收）
+        outward = np.sign(xs - nose_x)
+        shift = outward * (max_shift * w_band)
         map_x = (xs + shift).astype(np.float32)
-        # 两侧不重叠，均从原始帧采样写入 out，避免左右顺序依赖
         roi = cv2.remap(frame_bgr, map_x, ys.astype(np.float32),
                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        out[y0:y1, x_lo:x_hi] = roi
+        # 按 w_band 混合写入：远离本链的区域保持 out 原样。左右链的 ROI
+        # 在下巴处重叠，硬切 ROI 会让后处理一侧的近恒等场覆盖掉先处理
+        # 一侧的位移（互相抵消），alpha 混合则自然叠加。
+        alpha = w_band[..., None].astype(np.float32)
+        patch = roi.astype(np.float32) * alpha + \
+            out[y0:y1, x_lo:x_hi].astype(np.float32) * (1.0 - alpha)
+        out[y0:y1, x_lo:x_hi] = np.rint(patch).astype(np.uint8)
     return out
 
 
@@ -147,6 +161,7 @@ class BeautyEffect(Effect):
         return {
             "smooth": 0.6,       # 磨皮混合比 0~1（一期 0.6）
             "whiten": 15.0,      # 美白强度（LAB L 增量）0~30（一期 15）
+            "whiten_scope": "skin",  # 美白范围："skin" 全身肤色 / "face" 仅脸部
             "slim": 0.35,        # 瘦脸强度 0~1
             "eye_enabled": False,  # 大眼开关（一期默认关）
             "eye_strength": 0.18,   # 大眼强度 0~0.5（一期 0.18）
@@ -156,27 +171,28 @@ class BeautyEffect(Effect):
         if not self.enabled:     # 防御直接调用；Pipeline 本身也会跳过
             return frame
         p = self._p()
-        if not ctx.faces:
-            # 无脸时只做全帧轻磨皮，避免肤色掩膜误伤背景
-            if p["smooth"] > 0:
-                return self._smooth(frame, p["smooth"])
-            return frame
 
         # 1. 磨皮（保留纹理）
         if p["smooth"] > 0:
             frame = self._smooth(frame, p["smooth"])
 
-        # 2. 美白：肤色掩膜 ∩ 人脸轮廓掩膜
+        # 2. 美白：默认全身肤色（脖子/手臂等皮肤一并提亮）；选"仅脸部"时
+        #    再与 FaceMesh 轮廓掩膜求交（一期口径）
         if p["whiten"] > 0:
             skin = get_skin_mask(frame)
-            oval_total = np.zeros_like(skin)
-            for f in ctx.faces:
-                oval_total = cv2.bitwise_or(oval_total, face_oval_mask(frame, f.landmarks))
-            skin = cv2.bitwise_and(skin, oval_total)
+            if p["whiten_scope"] == "face" and ctx.faces:
+                oval_total = np.zeros_like(skin)
+                for f in ctx.faces:
+                    oval_total = cv2.bitwise_or(
+                        oval_total, face_oval_mask(frame, f.landmarks))
+                skin = cv2.min(skin, oval_total)
             if skin.any():
                 frame = whitening(frame, skin, p["whiten"])
 
-        # 3. 瘦脸 / 大眼（逐脸）
+        if not ctx.faces:
+            return frame
+
+        # 3. 瘦脸 / 大眼（逐脸，需关键点）
         for f in ctx.faces:
             frame = slim_face(frame, f.landmarks, p["slim"])
             if p["eye_enabled"] and p["eye_strength"] > 0:
