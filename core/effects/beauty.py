@@ -41,8 +41,8 @@ SLIM_CHIN_LIFT_RATIO = 0.25    # 下巴尖上收幅度 = 0.25 × max_shift（瘦
 SLIM_CHIN_WEIGHT = 2.5         # 下巴动点权值（抵消下方保护点的分母衰减）
 SLIM_UNDER_CHIN_DROP = 0.5     # 下巴下方合成保护点距离 = 0.5 ×（下巴到嘴距）
 SLIM_UNDER_CHIN_WEIGHT = 2.0   # 下方保护点权值：挡住笔刷向下挖脖子
-SLIM_FAR_RATIO_ZERO = 0.60     # 远端塌缩比 ≤ 此值：远端链幅度归零（重度侧脸）
-SLIM_FAR_RATIO_FULL = 0.85     # 远端塌缩比 ≥ 此值：远端链全幅度（基本正脸）
+SLIM_FAR_RATIO_ZERO = 0.52     # 远端塌缩比 ≤ 此值：远端链幅度归零（重度侧脸）
+SLIM_FAR_RATIO_FULL = 0.90     # 远端塌缩比 ≥ 此值：远端链全幅度（正脸实测 0.94）
 SLIM_BRUSH_HEIGHT_RATIO = 0.62  # 笔刷半径兜底：0.62×(额顶到下巴高)，侧头时脸宽塌缩防笔刷缩水
 EYE_RADIUS_RATIO = 0.045   # 大眼作用半径（占帧宽比例，作半径上限兜底）
 EYE_RADIUS_FROM_CORNERS = 0.85   # 大眼半径 = 眼角距 × 系数（自适应透视缩短）
@@ -53,13 +53,15 @@ EYE_STRENGTH_MAX = 0.5     # 大眼滑杆上限（一期默认 0.18）
 # 2D 液化变形隐含"正脸假设"：头偏航后远端下颌链的投影塌缩进脸颊中部，
 # 两链互相拉扯会产生伪影。防伪影主体已改为"远端链连续衰减"
 # （见 slim_face_controls：按两链塌缩比的几何量连续降幅度，转头全程
-# 无硬切），全局门控只作接近正侧脸时的兜底：
-#   - 估计偏航 ≤60° 全强度（估计值对中低角度系统性偏低，约对应真实
-#     转头 75° 内效果不打折）；
-#   - 60°~85° 线性衰减，≥85° 关闭（此时远端下颌完全不可见、近端
-#     轮廓贴耳缘，液化已无可靠作用对象）。
-YAW_FULL_DEG = 60.0        # |yaw| ≤ 此值：变形全强度
-YAW_ZERO_DEG = 85.0        # |yaw| ≥ 此值：变形完全关闭
+# 无硬切），全局门控只作幅度随角度的平滑递减：
+#   - 估计偏航 ≤55° 全强度（估计值对中低角度系统性偏低，约对应真实
+#     转头 72° 内效果不打折）；
+#   - 55°~95° 线性衰减；
+#   - ≥95° 保留 POSE_GATE_MIN（一半）强度——实机反馈"打一半试试"，
+#     极端角度不再关死，衰减后只作用于可见侧近端轮廓，实测无伪影。
+YAW_FULL_DEG = 55.0        # |yaw| ≤ 此值：变形全强度
+YAW_ZERO_DEG = 95.0        # |yaw| ≥ 此值：变形衰减到下限（不再归零）
+POSE_GATE_MIN = 0.5        # 门控下限（"打一半"）：极端角度保留的强度比例
 
 # 左/右眼关键点（外角、内角、上睑、下睑 —— 一期口径）
 LEFT_EYE_IDS = (33, 133, 159, 145)
@@ -105,13 +107,14 @@ def estimate_yaw_deg(landmarks: np.ndarray) -> float:
 def pose_gate(yaw_deg: float,
               full: float = YAW_FULL_DEG,
               zero: float = YAW_ZERO_DEG) -> float:
-    """头姿门控系数：正脸全强度 → 侧脸线性衰减到 0。"""
+    """头姿门控系数：正脸全强度 → 随角度线性衰减 → 极端角度保留
+    POSE_GATE_MIN（"打一半"，不归零）。"""
     a = abs(yaw_deg)
     if a <= full:
         return 1.0
     if a >= zero:
-        return 0.0
-    return 1.0 - (a - full) / (zero - full)
+        return POSE_GATE_MIN
+    return 1.0 - (1.0 - POSE_GATE_MIN) * (a - full) / (zero - full)
 
 
 def get_skin_mask(frame_bgr: np.ndarray) -> np.ndarray:

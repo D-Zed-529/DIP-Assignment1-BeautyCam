@@ -158,10 +158,14 @@ class TestEnlargeEyes(unittest.TestCase):
         self.assertTrue(np.array_equal(out[:40, :40], frame[:40, :40]))
 
     def test_disabled_at_large_yaw(self):
+        """极端偏航大眼仍工作但被门控衰减（不等于全强度效果）。"""
         frame = synth_face_frame()
         lm = self._spread_eyes(synth_face_landmarks(frame))
-        out = enlarge_eyes(frame, lm, strength=0.3, yaw_deg=B.YAW_ZERO_DEG)
-        self.assertTrue(np.array_equal(out, frame))
+        out_extreme = enlarge_eyes(frame, lm, strength=0.3,
+                                   yaw_deg=B.YAW_ZERO_DEG)
+        out_frontal = enlarge_eyes(frame, lm, strength=0.3, yaw_deg=0.0)
+        self.assertFalse(np.array_equal(out_extreme, frame))
+        self.assertFalse(np.array_equal(out_extreme, out_frontal))
 
     def test_squint_eye_skipped(self):
         """透视塌缩的眼睛（眼角距过小）不做变形。"""
@@ -332,9 +336,11 @@ class TestPoseGate(unittest.TestCase):
         self.assertEqual(pose_gate(0.0), 1.0)
         self.assertEqual(pose_gate(-B.YAW_FULL_DEG), 1.0)
         mid = (B.YAW_FULL_DEG + B.YAW_ZERO_DEG) / 2
-        self.assertAlmostEqual(pose_gate(mid), 0.5, places=6)
-        self.assertEqual(pose_gate(B.YAW_ZERO_DEG), 0.0)
-        self.assertEqual(pose_gate(90.0), 0.0)
+        # 衰减区间中点：从 1.0 线性降到下限 0.5 的过程值
+        self.assertAlmostEqual(pose_gate(mid),
+                               1.0 - 0.5 * (1.0 - B.POSE_GATE_MIN), places=6)
+        self.assertAlmostEqual(pose_gate(B.YAW_ZERO_DEG), B.POSE_GATE_MIN)
+        self.assertEqual(pose_gate(120.0), B.POSE_GATE_MIN)
 
     def test_slim_chin_also_lifted(self):
         """瘦脸时下巴尖也应上收（"下巴也瘦一点"），水平方向不外扩。"""
@@ -348,11 +354,15 @@ class TestPoseGate(unittest.TestCase):
         self.assertLess(dy, -3.0)     # 内容上移 = 下巴收短
         self.assertLess(abs(dx), 2.0)  # 不应水平外扩（防尖锥回归）
 
-    def test_slim_disabled_at_large_yaw(self):
+    def test_slim_half_floor_at_extreme_yaw(self):
+        """极端偏航不再关死（"打一半"）：仍有效果，但明显弱于正脸。"""
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
-        out = slim_face(frame, lm, strength=1.0, yaw_deg=B.YAW_ZERO_DEG)
-        self.assertTrue(np.array_equal(out, frame))
+        out_extreme = slim_face(frame, lm, strength=1.0,
+                                yaw_deg=B.YAW_ZERO_DEG)
+        out_frontal = slim_face(frame, lm, strength=1.0, yaw_deg=0.0)
+        self.assertFalse(np.array_equal(out_extreme, frame))    # 仍有作用
+        self.assertFalse(np.array_equal(out_extreme, out_frontal))  # 但被衰减
 
     def test_slim_far_side_suppressed(self):
         """侧脸（中重度偏航）时远端（塌缩侧）位移远小于近端（真实轮廓侧）。
