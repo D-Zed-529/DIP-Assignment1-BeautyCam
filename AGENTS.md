@@ -46,7 +46,7 @@
 
 ## 验证方式
 
-- 单测：`python -m unittest discover tests`（109 个用例：美颜纯函数 / V 手势 / 笑脸 / 状态机 / 管线 / 隔帧节流 / 采集源 / 推理引擎 / 分割模型语义 / 背景替换纯函数；不依赖摄像头与 GUI）。
+- 单测：`python -m unittest discover tests`（124 个用例：美颜纯函数 / V 手势 / 笑脸 / 状态机 / 管线 / 隔帧节流 / 采集源 / 推理引擎 / 分割模型语义 / 背景替换纯函数 / 瘦脸液化；不依赖摄像头与 GUI；需先跑 `scripts/download_models.py`，缺权重时推理引擎类用例自动跳过）。
 - headless 批跑：`python scripts/run_pipeline.py --input assets/samples --output outputs/`（真图验证整条推理+效果链）。
 - 虚拟背景出图自检：加 `--segment --seg-dump-alpha` 看 alpha 灰度图**人是不是白的**（这是识别掩膜反转最快的手段），加 `--seg-compare` 出边缘处理四档对比图。
 - 涉及摄像头/GUI 的改动，请用户实机运行 `python -m gui.main_window` 确认。
