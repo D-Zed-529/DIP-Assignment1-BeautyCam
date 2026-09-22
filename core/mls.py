@@ -31,6 +31,52 @@ def identity_maps(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
     return mx, my
 
 
+def upsample_displacement_field(dx: np.ndarray, dy: np.ndarray,
+                                x1: int, y1: int, grid_step: int,
+                                h: int, w: int,
+                                x2: int | None = None,
+                                y2: int | None = None
+                                ) -> tuple[np.ndarray, np.ndarray]:
+    """粗网格位移场 → 稠密 cv2.remap 采样图（MLS 与液化共用例程）。
+
+    dx/dy: 网格节点上的采样图偏移 (gh,gw)（map = v + offset，节点绝对
+    位置 = (x1+j·step, y1+i·step)；注意这是 remap 逆映射的采样偏移，
+    与内容位移反号）；
+    ROI = (x1, y1, x2, y2)（None 时取图像右/下边缘），ROI 外严格恒等。
+    稠密像素 j 必须严格采样网格节点 j/grid_step（不能用 cv2.resize：其
+    像素中心约定会系统性偏移 ~0.5 个节点，grid_step=6 时即 2.5px 内容
+    平移，锚点钉扎失效）。尾部覆盖不到 ROI 边缘时用"虚拟节点"补齐
+    （位置前进、位移=0）：若直接 clip 到末节点，map 的绝对位置在尾部
+    被冻结，位移会变成 末节点位置−x 的线性负斜坡（ROI 边缘假漂移）。
+    """
+    dense_w = (w if x2 is None else x2) - x1
+    dense_h = (h if y2 is None else y2) - y1
+    need_c = int(np.ceil((dense_w - 1) / grid_step)) + 1
+    need_r = int(np.ceil((dense_h - 1) / grid_step)) + 1
+    pad_c = max(need_c - dx.shape[1], 0)
+    pad_r = max(need_r - dx.shape[0], 0)
+    dx = np.pad(dx, ((0, pad_r), (0, pad_c)))
+    dy = np.pad(dy, ((0, pad_r), (0, pad_c)))
+    gx_p = x1 + np.arange(dx.shape[1], dtype=np.float64) * grid_step
+    gy_p = y1 + np.arange(dx.shape[0], dtype=np.float64) * grid_step
+    fx = gx_p.astype(np.float32)[None, :] + dx.astype(np.float32)
+    fy = gy_p.astype(np.float32)[:, None] + dy.astype(np.float32)
+    kx = np.clip(np.arange(dense_w, dtype=np.float32) / grid_step,
+                 0.0, dx.shape[1] - 1)
+    ky = np.clip(np.arange(dense_h, dtype=np.float32) / grid_step,
+                 0.0, dx.shape[0] - 1)
+    kk_x, kk_y = np.meshgrid(kx, ky)
+    up_kwargs = dict(interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REPLICATE)
+    fx_up = cv2.remap(fx, kk_x, kk_y, **up_kwargs)
+    fy_up = cv2.remap(fy, kk_x, kk_y, **up_kwargs)
+
+    map_x, map_y = identity_maps(h, w)
+    map_x[y1:y1 + dense_h, x1:x1 + dense_w] = fx_up
+    map_y[y1:y1 + dense_h, x1:x1 + dense_w] = fy_up
+    return map_x, map_y
+
+
 def mls_similarity_maps(h: int, w: int, P: np.ndarray, Q: np.ndarray,
                         grid_step: int = GRID_STEP,
                         roi: tuple[int, int, int, int] | None = None,
@@ -134,36 +180,5 @@ def _mls_maps(h: int, w: int, P: np.ndarray, Q: np.ndarray, *,
         dx = dx * window
         dy = dy * window
 
-    # ---- 粗网格位移场双线性上采样成稠密场 ----
-    # 注意不能用 cv2.resize：其像素中心约定会把采样坐标系统性偏移
-    # ~0.5 个网格节点（grid_step=6 时即 2.5px 内容平移，锚点钉扎失效）。
-    # dense 像素 j（绝对位置 x1+j）必须严格采样网格节点 j/grid_step。
-    # arange 截断会让节点覆盖不到 ROI 边缘，尾部用"虚拟节点"补齐
-    #（位置前进、位移=0）：若直接 clip 到末节点，map 的绝对位置在尾部
-    # 被冻结，位移会变成 末节点位置−x 的线性负斜坡（ROI 边缘假漂移）。
-    dense_w = x2 - x1
-    dense_h = y2 - y1
-    need_c = int(np.ceil((dense_w - 1) / grid_step)) + 1
-    need_r = int(np.ceil((dense_h - 1) / grid_step)) + 1
-    pad_c = max(need_c - dx.shape[1], 0)
-    pad_r = max(need_r - dx.shape[0], 0)
-    dx = np.pad(dx, ((0, pad_r), (0, pad_c)))
-    dy = np.pad(dy, ((0, pad_r), (0, pad_c)))
-    gx_p = x1 + np.arange(dx.shape[1], dtype=np.float64) * grid_step
-    gy_p = y1 + np.arange(dx.shape[0], dtype=np.float64) * grid_step
-    fx = gx_p.astype(np.float32)[None, :] + dx.astype(np.float32)
-    fy = gy_p.astype(np.float32)[:, None] + dy.astype(np.float32)
-    kx = np.clip(np.arange(dense_w, dtype=np.float32) / grid_step,
-                 0.0, dx.shape[1] - 1)
-    ky = np.clip(np.arange(dense_h, dtype=np.float32) / grid_step,
-                 0.0, dx.shape[0] - 1)
-    kk_x, kk_y = np.meshgrid(kx, ky)
-    up_kwargs = dict(interpolation=cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_REPLICATE)
-    fx_up = cv2.remap(fx, kk_x, kk_y, **up_kwargs)
-    fy_up = cv2.remap(fy, kk_x, kk_y, **up_kwargs)
-
-    map_x, map_y = identity_maps(h, w)
-    map_x[y1:y2, x1:x2] = fx_up
-    map_y[y1:y2, x1:x2] = fy_up
-    return map_x, map_y
+    # ---- 粗网格位移场上采样成稠密场（公共例程，节点对齐约定见其 docstring） ----
+    return upsample_displacement_field(dx, dy, x1, y1, grid_step, h, w, x2, y2)

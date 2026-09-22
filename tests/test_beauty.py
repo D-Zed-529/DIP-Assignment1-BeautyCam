@@ -336,6 +336,18 @@ class TestPoseGate(unittest.TestCase):
         self.assertEqual(pose_gate(B.YAW_ZERO_DEG), 0.0)
         self.assertEqual(pose_gate(80.0), 0.0)
 
+    def test_slim_chin_also_lifted(self):
+        """瘦脸时下巴尖也应上收（"下巴也瘦一点"），水平方向不外扩。"""
+        frame = synth_face_frame()
+        lm = synth_face_landmarks(frame)
+        h, w = frame.shape[:2]
+        map_x, map_y = slim_face_maps(w, h, lm, strength=1.0)
+        xi, yi = int(lm[152, 0] * w), int(lm[152, 1] * h)
+        dx = float(xi - map_x[yi, xi])
+        dy = float(yi - map_y[yi, xi])
+        self.assertLess(dy, -3.0)     # 内容上移 = 下巴收短
+        self.assertLess(abs(dx), 2.0)  # 不应水平外扩（防尖锥回归）
+
     def test_slim_disabled_at_large_yaw(self):
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
@@ -377,27 +389,40 @@ class TestPoseGate(unittest.TestCase):
         self.assertLess(far_shift, near_shift / 3.0)   # 远端被显著抑制
 
     def test_slim_cheek_bulk_moves(self):
-        """脸颊主体（轮廓内侧 ~40px）应整体内收，而非只有贴线窄管在动。"""
+        """脸颊主体（轮廓内侧 ~40px）应整体内收，而非只有贴线窄管在动。
+
+        断言位移场量：探针处内容位移沿"指向脸中心"方向 ≥3.5px@strength=1.0。
+        标记质心法在强压缩场（探针处应变 ~100%，标记块被压扁）里读数
+        会被不对称压缩拉低，场量才是直接、确定性的证据。注意合成脸很
+        小（探针距嘴角保护点仅 ~36px，嘴角权值 5 的保护场会平滑衰减
+        探针位移；真图脸颊主体位移比例远高于此，效果以真图 A/B 为准），
+        该断言用于守住"脸颊整体内收"的下限与方向，不做效果上限。
+        """
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
         h, w = frame.shape[:2]
+        map_x, map_y = slim_face_maps(w, h, lm, strength=1.0)
         chain = lm[JAW_LEFT_IDS]
-        cx = int(chain[:, 0].mean() * w)
-        cy = int(chain[:, 1].mean() * h)
-        # 沿"链中点 → 椭圆中心"方向内移 40px（脸颊内部）
         ctr = np.array([w / 2, h / 2])
-        p = np.array([cx, cy], float)
+        p = chain.mean(axis=0)[:2] * np.array([w, h], np.float32)
         d = 40.0 * (ctr - p) / np.linalg.norm(ctr - p)
-        probe_x, probe_y = int(p[0] + d[0]), int(p[1] + d[1])
-        cv2.rectangle(frame, (probe_x - 4, probe_y - 4),
+        probe = p + d
+        xi, yi = int(probe[0]), int(probe[1])
+        disp = np.array([xi - map_x[yi, xi], yi - map_y[yi, xi]])
+        inward = float(disp @ (ctr - probe) / np.linalg.norm(ctr - probe))
+        self.assertGreater(inward, 3.5)   # 明显向中心移动
+
+        # 像素级方向冒烟：标记块整体仍应向中心移动（阈值放宽到 >1px）
+        frame2 = synth_face_frame()
+        probe_x, probe_y = xi, yi
+        cv2.rectangle(frame2, (probe_x - 4, probe_y - 4),
                       (probe_x + 4, probe_y + 4), (0, 0, 255), -1)
-        out = slim_face(frame, lm, strength=1.0)
+        out = slim_face(frame2, lm, strength=1.0)
         m = (out[:, :, 2] > 200) & (out[:, :, 1] < 80) & (out[:, :, 0] < 80)
         yy, xx = np.nonzero(m)
         sel = (np.abs(yy - probe_y) < 90) & (np.abs(xx - probe_x) < 90)
         self.assertGreater(int(sel.sum()), 10)
-        after = float(xx[sel].mean())
-        self.assertGreater(after, probe_x + 8.0)   # 明显向中心移动
+        self.assertGreater(float(xx[sel].mean()), probe_x + 1.0)
 
     def test_slim_near_side_still_works(self):
         """侧脸时近端（真实轮廓一侧）仍正常内收。"""

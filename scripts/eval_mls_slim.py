@@ -1,8 +1,9 @@
-"""MLS 瘦脸 v4 真图 A/B 评测：标记位移 + 性能 + 对照图。
+"""瘦脸真图评测：标记位移 + 性能 + 对照图（v5 液化 / v4 MLS 可选）。
 
-用法：.venv/bin/python scripts/eval_mls_slim.py [图像路径]
-输出：outputs/mls_v4_*.jpg 与位移/耗时指标（stdout）。
+用法：.venv/bin/python scripts/eval_mls_slim.py [图像路径] [--method v5]
+输出：outputs/slim_<method>_*.jpg 与位移/耗时指标（stdout）。
 """
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -12,9 +13,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from core.context import FrameContext, FaceInfo  # noqa: E402
+from core.context import FrameContext  # noqa: E402,F401  (保持与管线同构)
 from core.effects.beauty import (  # noqa: E402
-    JAW_LEFT_IDS, JAW_RIGHT_IDS, slim_face,
+    estimate_yaw_deg, slim_face,
 )
 from core.infer import InferenceEngine  # noqa: E402
 
@@ -51,18 +52,19 @@ def centroid_around(img, xy, color, win=14):
     return (xs.mean() + max(x - win, 0), ys.mean() + max(y - win, 0))
 
 
-def main(img_path: str):
+def main(img_path: str, method: str, strength: float):
     src = cv2.imread(img_path)
     assert src is not None, f"读图失败: {img_path}"
     h, w = src.shape[:2]
-    print(f"输入 {w}x{h}: {img_path}")
+    print(f"输入 {w}x{h}: {img_path}  method={method}")
 
     eng = InferenceEngine()
     ctx = eng.process(src, hands=False)
     assert ctx.faces and ctx.faces[0].landmarks is not None, "未检出人脸/关键点"
     face = ctx.faces[0]
     lm = face.landmarks            # (468,3) 归一化
-    print(f"人脸框 {face.box}, 关键点 {lm.shape}")
+    yaw = estimate_yaw_deg(lm)
+    print(f"人脸框 {face.box}, 关键点 {lm.shape}, yaw={yaw:+.1f}°")
 
     # ---------- 位移测量（带标记） ----------
     marked = src.copy()
@@ -73,9 +75,9 @@ def main(img_path: str):
         for i in ids:
             draw_marker(marked, lm_px[i], COLORS[label], r=6)
 
-    out = slim_face(marked.copy(), lm, strength=0.40)
+    out = slim_face(marked.copy(), lm, strength=strength, method=method)
 
-    print("\n== 标记位移（strength=0.40，正值为靠近脸中心/保护域应≈0）==")
+    print(f"\n== 标记位移（strength={strength:.2f}，正值=靠近脸中心/保护域应≈0）==")
     face_cx = lm_px[1, 0]
     for label, ids in groups.items():
         for i in ids:
@@ -91,20 +93,25 @@ def main(img_path: str):
     # ---------- 性能 ----------
     t0 = time.perf_counter()
     for _ in range(20):
-        slim_face(src, lm, strength=0.40)
+        slim_face(src, lm, strength=strength, method=method)
     dt = (time.perf_counter() - t0) / 20 * 1000
-    print(f"\nslim_face 均耗: {dt:.1f}ms/帧 ({w}x{h})")
+    print(f"\nslim_face[{method}] 均耗: {dt:.1f}ms/帧 ({w}x{h})")
 
     # ---------- 对照图 ----------
     out_dir = Path("outputs")
     out_dir.mkdir(exist_ok=True)
-    cv2.imwrite(str(out_dir / "mls_v4_origin.jpg"), src, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    slim_vis = slim_face(src.copy(), lm, strength=0.40)
-    cv2.imwrite(str(out_dir / "mls_v4_slim40.jpg"), slim_vis, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    slim100 = slim_face(src.copy(), lm, strength=1.0)
-    cv2.imwrite(str(out_dir / "mls_v4_slim100.jpg"), slim100, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"\n对照图已存 {out_dir}/mls_v4_{{origin,slim40,slim100}}.jpg")
+    cv2.imwrite(str(out_dir / f"slim_{method}_origin.jpg"), src,
+                [cv2.IMWRITE_JPEG_QUALITY, 92])
+    cv2.imwrite(str(out_dir / f"slim_{method}_s{int(strength * 100):03d}.jpg"),
+                slim_face(src.copy(), lm, strength=strength, method=method),
+                [cv2.IMWRITE_JPEG_QUALITY, 92])
+    print(f"\n对照图已存 {out_dir}/slim_{method}_*.jpg")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "assets/samples/portrait1.jpg")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("image", nargs="?", default="assets/samples/portrait1.jpg")
+    ap.add_argument("--method", default="v5", choices=["v4", "v5"])
+    ap.add_argument("--strength", type=float, default=0.40)
+    a = ap.parse_args()
+    main(a.image, a.method, a.strength)
