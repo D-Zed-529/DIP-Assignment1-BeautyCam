@@ -35,6 +35,13 @@ MANIFEST: list[tuple[str, str, int]] = [
      "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
      "selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
      16_371_837),
+    # Phase 3 主力分割模型：二元「人 vs 非人」，250KB，比上面 6 分类的 16.4MB
+    # 小 65 倍、快一个数量级（P3-0 冒烟基准见 core/infer.py 模块头）。虚拟背景
+    # 只需前景/背景二分类，多分类那 5 类信息用不上却要多付 10 倍算力。
+    ("selfie_segmenter.tflite",
+     "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
+     "selfie_segmenter/float16/latest/selfie_segmenter.tflite",
+     249_537),
 ]
 
 CHUNK = 1 << 20   # 1 MiB

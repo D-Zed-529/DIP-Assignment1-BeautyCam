@@ -47,6 +47,10 @@ class FrameContext:
     hands: list[HandInfo] = field(default_factory=list)
     # (h, w) uint8，前景=255 背景=0；未启用分割时为 None（Phase 3 使用）
     person_mask: Optional[np.ndarray] = None
+    # (h, w) float32 0~1，前景概率 = 由分割置信图导出的**原始**软掩膜（Phase 3）。
+    # 未启用分割时为 None。注意这里不做任何"锐化/拉伸"——那是效果层的画质决策，
+    # 属于 SegmentEffect 的 matte_contrast 参数（便于 GUI 实时调参与对比实验）。
+    person_alpha: Optional[np.ndarray] = None
 
     # ------- 便捷查询 -------
 

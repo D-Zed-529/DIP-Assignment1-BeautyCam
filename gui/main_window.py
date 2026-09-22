@@ -24,9 +24,12 @@ from PySide6.QtWidgets import (
 from core.camera import LiveCamera, VideoFileSource
 from core.effects.beauty import BeautyEffect
 from core.effects.lowlight import LowLightEffect
-from core.infer import get_engine
+from core.effects.segment import SegmentEffect
+from core.infer import SEGMENTER_INTERVAL, get_engine
 from core.pipeline import Pipeline
-from gui.panels import BeautyPanel, CapturePanel, LowLightPanel
+from gui.panels import (
+    BeautyPanel, CapturePanel, LowLightPanel, SegmentPanel,
+)
 from gui.workers import CameraWorker, PHOTOS_DIR
 
 RECENT_PHOTOS = 4          # 预览条缩略图数量（一期口径）
@@ -75,10 +78,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("BeautyCam v2")
         self.resize(1280, 760)
 
-        # 管线：低光增强 → 美颜（HDR 为拍照模式，不进逐帧链）
+        # 管线：低光增强 → 美颜 → 人像虚化/背景替换（HDR 为拍照模式，不进逐帧链）
+        # 顺序对齐 PLAN §3.2。背景替换放链末：合成边界不再被后续效果处理，
+        # 人像与新背景的接缝保持干净（掩膜与美颜的几何耦合见 core/effects/segment.py）
         self.pipeline = Pipeline([
             LowLightEffect(enabled=False),
             BeautyEffect(enabled=True),
+            SegmentEffect(enabled=False),
         ])
         self.engine = get_engine()
         self.worker: Optional[CameraWorker] = None
@@ -154,6 +160,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.beauty_panel)
         self.lowlight_panel = LowLightPanel(self.pipeline)
         lay.addWidget(self.lowlight_panel)
+        self.segment_panel = SegmentPanel(self.pipeline, self._on_model_change)
+        lay.addWidget(self.segment_panel)
         self.capture_panel = CapturePanel(self._manual_capture)
         lay.addWidget(self.capture_panel)
 
@@ -268,6 +276,24 @@ class MainWindow(QMainWindow):
         # 触发器复选框变化同步给 worker（collection 赋值原子，无需锁）
         if self.worker is not None:
             self.worker.triggers = self.capture_panel.triggers()
+
+    def _on_model_change(self, key: str) -> None:
+        """切换分割模型：会话重建交给工作线程，同时同步隔帧间隔。
+
+        间隔必须跟着模型走 —— 二元 13ms 可每帧跑，多分类 155ms 必须隔帧，
+        否则三开会从 14fps 掉到 7fps 以下。
+        """
+        interval = SEGMENTER_INTERVAL[key]
+        self.pipeline.set_params("segment", infer_interval=interval)
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.request_segmenter_model(key)
+            self.statusBar().showMessage(
+                f"分割模型将切换为 {key}（推理间隔 {interval} 帧）")
+        else:
+            # 没在跑就不用担心撞上推理，直接切
+            self.engine.set_segmenter_model(key)
+            self.statusBar().showMessage(
+                f"分割模型已切换为 {key}（推理间隔 {interval} 帧）")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Space:

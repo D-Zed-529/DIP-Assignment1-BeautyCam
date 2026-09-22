@@ -2,5 +2,6 @@
 
 from .beauty import BeautyEffect
 from .lowlight import LowLightEffect
+from .segment import SegmentEffect
 
-__all__ = ["BeautyEffect", "LowLightEffect"]
+__all__ = ["BeautyEffect", "LowLightEffect", "SegmentEffect"]
