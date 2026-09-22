@@ -106,9 +106,13 @@ MainWindow（主线程）：ndarray → QImage 绘制；用户操作 → pipelin
 gamma 包围曝光模拟 → ECC 对齐 → MergeMertens 融合 →（可选）色调映射显示；（进阶）HDRUNet ONNX 单帧 HDR 作对比线。
 **验收**：逆光场景出片高光不过曝、暗部有细节；每张成片保留"单张 vs 融合"对照。
 
+> **已完成（2026-09-22）**。EV 三预设（3张±1EV 默认）+ gamma LUT 模拟（高光平滑压缩非硬 clip）+ ECC EUCLIDEAN 对齐 + Mertens + Drago/Reinhard 显示选项；成片/各 EV 原图/对照图一并存档。**实施坑（已入 AGENTS.md #12）**：findTransformECC 返回的 warp 是 template→input 方向，应用须取仿射逆——误用方向不报错、只会更歪（合成平移实验 13.3→23.8，取逆 →1.6）。11 个纯函数单测锁定。HDRUNet 进阶线未做（经典线已达验收）。
+
 ### Phase 2 — 低光增强（2–3 人日）
 模型选型定版（SCI vs Zero-DCE++，按 ONNX 可得性与实测速度）→ ONNX 会话管理（CoreML EP + provider 记录）→ ≤480p 推理 + 上采样 → 隔帧 + 时域平滑 → 亮度自动触发。
 **验收**：暗光环境预览 ≥20fps；输出与旧启发式增强的对比图。
+
+> **已完成（2026-09-22），定版 SCI**（Zero-DCE++ 无现成 ONNX 需自行导出，SCI 直接可得）。54KB、固定 512×512 输入（输出取张量 [1]）、三档强度；**CoreML EP 1.7ms vs CPU 7.4ms（4.3 倍，创建即打印实际 provider）**。客观评测（`scripts/eval_lowlight.py`，合成暗图）：**SCI-medium 22.1dB/0.860 vs 启发式 14.4dB/0.753**，深度线 +7.7dB 完胜，答辩对比素材成立。隔帧默认 2 + 复用上一帧结果；启发式保留为可切基线（GUI 双引擎下拉）。
 
 ### Phase 3 — 人像虚化 / 背景替换（3–5 人日）
 MediaPipe Selfie Segmentation 掩膜（EMA 平滑 + 羽化）→ 基础虚化（强度滑杆）→ 背景替换（图库 + 自选）；进阶档：Depth Anything V2 小模型深度渐进虚化。
@@ -129,9 +133,13 @@ MediaPipe Selfie Segmentation 掩膜（EMA 平滑 + 羽化）→ 基础虚化（
 `demos/faceswap/`：FaceMesh 关键点 → Delaunay 三角剖分 → 分块仿射变形 → `seamlessClone` 泊松融合 → Reinhard 色彩迁移；三角剖分过程动画作为课堂讲解素材；（可选）实时换脸演示模式。
 **验收**：能完整展示算法各阶段中间产物；效果达"可辨识换脸"级别即合格。
 
+> **已完成（2026-09-22）**（离线版 + 过程可视化 + 伦理门；实时版 P4-3 为可选项未做）。stage1~5 全阶段存图 + 三联对照。两个实施坑入 AGENTS.md #13：warpAffine 输出窗口原点恒为 (0,0)（bbox 子图 warp 需平移分量减原点）、三角 bbox 越画布须裁相交区。泊松融合对纯色 src 会退化为 dst（梯度恒 0，数学正确）——测试要用带纹理的源图。伦理约束以 `--consent` 强制确认门落地（缺省拒绝运行）。
+
 ### Phase 5 — GPU 加速、评测与答辩（3–5 人日）
 CoreML EP 全模型验证（防静默回退，记录实际 provider）→ 性能基准（单开/组合开 FPS、各阶段耗时分解、CPU vs CoreML）→ 客观评测（低光 PSNR/SSIM）→ 主观评测（Likert 问卷，延续一期方法学）→ PPT 与演示脚本。
 **验收**：性能对比表 + 至少两组量化实验数据 + 完整演示走查。
+
+> **代码与数据部分已完成（2026-09-22）**：① CoreML EP 启用并验证（SCI 4.3 倍，创建即打印 provider）；② `scripts/bench.py` 性能基准（各功能分解 + 后端对比）——**首版开放式计时循环把 mediapipe 刷爆内存（OOM），教训入 AGENTS.md #15**；③ `scripts/eval_lowlight.py` PSNR/SSIM（手写实现不依赖 skimage）。主观问卷（P5-4）与 PPT（P5-5）为小组线下工作。同日完成**性能优化专项**（用户要求）：磨皮/掩膜半分辨率、美白 boundingRect、瘦脸 ROI remap（逐位等价有单测锁定）、GUI worker 侧预缩放——美颜全链 18.4→9.4ms，组合链路详见 TODO.md 专项表。
 
 ### 时间线汇总
 

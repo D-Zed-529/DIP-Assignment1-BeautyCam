@@ -42,6 +42,21 @@ MANIFEST: list[tuple[str, str, int]] = [
      "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
      "selfie_segmenter/float16/latest/selfie_segmenter.tflite",
      249_537),
+    # Phase 2 低光增强 SCI（CVPR 2022）ONNX 三档强度：54KB、固定 512×512
+    # 输入，CoreML EP 实测 1.6ms/次（P2-1 定版记录见 core/infer.py 模块头）。
+    # 源仓库 Kazuhito00/SCI-ONNX-Sample（原作 Tao et al. 官方权重的 ONNX 化）。
+    ("sci_easy_512x512.onnx",
+     "https://github.com/Kazuhito00/SCI-ONNX-Sample/raw/main/model/"
+     "sci_easy_512x512.onnx",
+     54_613),
+    ("sci_medium_512x512.onnx",
+     "https://github.com/Kazuhito00/SCI-ONNX-Sample/raw/main/model/"
+     "sci_medium_512x512.onnx",
+     54_613),
+    ("sci_difficult_512x512.onnx",
+     "https://github.com/Kazuhito00/SCI-ONNX-Sample/raw/main/model/"
+     "sci_difficult_512x512.onnx",
+     54_613),
 ]
 
 CHUNK = 1 << 20   # 1 MiB

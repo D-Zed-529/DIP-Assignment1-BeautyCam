@@ -18,6 +18,10 @@
 
   # 禁用全部推理效果（测采集/IO 吞吐基线）
   python scripts/run_pipeline.py --input dir/ --raw
+
+  # 自适应画质：分区自动曝光 + CLAHE + 白平衡（全时段经典 DIP 校正）
+  python scripts/run_pipeline.py --input assets/samples --no-beauty \
+      --autoenhance --ae-strength 1.0 --ae-smooth 0
 """
 
 from __future__ import annotations
@@ -36,8 +40,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.camera import ImageSequenceSource, VideoFileSource  # noqa: E402
 from core.context import FrameContext                          # noqa: E402
-from core.effects.beauty import BeautyEffect                    # noqa: E402
-from core.effects.lowlight import LowLightEffect                # noqa: E402
+from core.effects.autoenhance import AutoEnhanceEffect         # noqa: E402
+from core.effects.beauty import BeautyEffect                   # noqa: E402
+from core.effects.lowlight import LowLightDnnEffect, LowLightEffect  # noqa: E402
 from core.effects.segment import (                              # noqa: E402
     MODE_BLUR, MODE_COLOR, MODE_IMAGE, SegmentEffect,
 )
@@ -172,12 +177,36 @@ def main() -> int:
     ap.add_argument("--slim", type=float, default=0.35, help="瘦脸 0~1")
     ap.add_argument("--eye", type=float, default=0.0, help="大眼强度 0~0.5（0=关）")
     ap.add_argument("--lowlight", action="store_true", help="启用启发式低光增强")
+    ap.add_argument("--lowlight-dnn", action="store_true",
+                    help="启用 SCI 深度低光增强（Phase 2 主力档，覆盖 --lowlight）")
+    ap.add_argument("--lowlight-level", choices=("easy", "medium", "difficult"),
+                    default="medium", help="SCI 强度档（仅 --lowlight-dnn）")
+    ap.add_argument("--lowlight-strength", type=float, default=1.0,
+                    help="低光增强强度 0~1（结果与暗图混合）")
+    ap.add_argument("--lowlight-force", action="store_true",
+                    help="关闭亮度自动触发（强制所有帧都增强；评测用）")
     ap.add_argument("--raw", action="store_true",
                     help="关闭全部效果（IO/采集基线）")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="最多处理帧数（0=不限，视频调试用）")
     ap.add_argument("--save-video", action="store_true",
                     help="视频输入时输出合成视频而非逐帧图片")
+    # ---- 自适应画质优化（Phase 4） ----
+    ae = ap.add_argument_group("自适应画质优化")
+    ae.add_argument("--autoenhance", action="store_true",
+                    help="启用自适应画质（分区自动曝光 + CLAHE + 白平衡，全时段经典 DIP）")
+    ae.add_argument("--ae-strength", type=float, default=0.8,
+                    help="总强度 0~1（结果与原图混合）")
+    ae.add_argument("--ae-face-expo", type=float, default=0.7,
+                    help="人脸曝光优先 0~1（人脸目标亮度 115→150 插值；0=全图统一）")
+    ae.add_argument("--ae-contrast", type=float, default=0.3,
+                    help="CLAHE 对比度 0~1（0=关）")
+    ae.add_argument("--ae-color", type=float, default=0.5,
+                    help="灰世界白平衡强度 0~1（0=关）")
+    ae.add_argument("--ae-sat", type=float, default=0.0,
+                    help="饱和度增强 0~1（0=关）")
+    ae.add_argument("--ae-smooth", type=float, default=0.8,
+                    help="统计量时域平滑 0~0.95")
     # ---- 人像虚化 / 背景替换（Phase 3） ----
     seg = ap.add_argument_group("人像虚化 / 背景替换")
     seg.add_argument("--segment", action="store_true", help="启用背景替换")
@@ -207,13 +236,29 @@ def main() -> int:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 组装管线（与 GUI 同一套效果类）
+    # 组装管线（与 GUI 同一套效果类）；autoenhance 放链首：先校正曝光/色调
+    autoenhance = AutoEnhanceEffect(
+        enabled=args.autoenhance and not args.raw,
+        params={"strength": args.ae_strength,
+                "face_exposure": args.ae_face_expo,
+                "contrast": args.ae_contrast, "color": args.ae_color,
+                "saturation": args.ae_sat, "smooth": args.ae_smooth})
     beauty = BeautyEffect(enabled=args.beauty and not args.raw, params={
         "smooth": args.smooth, "whiten": args.whiten,
         "slim": args.slim, "eye_enabled": args.eye > 0,
         "eye_strength": args.eye,
     })
-    lowlight = LowLightEffect(enabled=args.lowlight and not args.raw)
+    if args.lowlight_dnn:
+        lowlight = LowLightDnnEffect(
+            enabled=not args.raw,
+            params={"level": args.lowlight_level,
+                    "strength": args.lowlight_strength,
+                    "auto": not args.lowlight_force})
+    else:
+        lowlight = LowLightEffect(
+            enabled=args.lowlight and not args.raw,
+            params={"strength": args.lowlight_strength,
+                    "auto": not args.lowlight_force})
     bg_path = os.path.abspath(args.seg_bg) if args.seg_bg else ""
     # 间隔默认跟随模型：二元 13ms 可每帧跑，多分类 155ms 必须隔帧
     seg_interval = args.seg_interval or SEGMENTER_INTERVAL[args.seg_model]
@@ -224,7 +269,7 @@ def main() -> int:
         "feather": args.seg_feather, "smooth": args.seg_smooth,
         "infer_interval": seg_interval,
     })
-    pipeline = Pipeline([lowlight, beauty, segment])
+    pipeline = Pipeline([autoenhance, lowlight, beauty, segment])
 
     if args.raw:
         engine = None

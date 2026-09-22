@@ -487,3 +487,38 @@ class TestPoseGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerfEquivalence(unittest.TestCase):
+    """性能优化（ROI remap / 半分辨率）与原实现的数值等价性。"""
+
+    def test_slim_roi_remap_bitwise_equal(self):
+        """瘦脸 ROI remap 必须与全帧 remap 逐位一致（仅性能优化，不改结果）。"""
+        frame = synth_face_frame(w=320, h=240, seed=7)
+        lm = synth_face_landmarks(frame)
+        map_x, map_y = slim_face_maps(320, 240, lm, strength=1.0, yaw_deg=0.0)
+        full = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REPLICATE)
+        roi_out = slim_face(frame, lm, strength=1.0, yaw_deg=0.0)
+        self.assertTrue(np.array_equal(full, roi_out))
+
+    def test_whitening_bbox_matches_masked_region(self):
+        """美白 boundingRect 路径：盒外严格不变、盒内确实提亮。"""
+        frame = synth_face_frame(w=320, h=240, seed=9)
+        mask = np.zeros(frame.shape[:2], np.uint8)
+        mask[40:160, 60:220] = 200       # 任意矩形软掩膜
+        out = whitening(frame, mask, strength=25.0)
+        self.assertTrue(np.array_equal(out[:40], frame[:40]))      # 盒外不变
+        lab_in = cv2.cvtColor(frame[41:159, 61:219], cv2.COLOR_BGR2LAB)
+        lab_out = cv2.cvtColor(out[41:159, 61:219], cv2.COLOR_BGR2LAB)
+        self.assertGreater(float(lab_out[:, :, 0].mean()),
+                           float(lab_in[:, :, 0].mean()))          # L 通道提亮
+
+    def test_skin_mask_halfres_shape_and_semantics(self):
+        """肤色掩膜半分辨率路径：形状不变、肤色区命中、背景区 miss。"""
+        frame = synth_face_frame(w=320, h=240, seed=3)
+        mask = get_skin_mask(frame)
+        self.assertEqual(mask.shape, frame.shape[:2])
+        h, w = mask.shape
+        self.assertGreater(float(mask[h // 2, w // 2]) / 255.0, 0.5)   # 脸中心
+        self.assertLess(float(mask[10, 10]) / 255.0, 0.1)              # 角落背景

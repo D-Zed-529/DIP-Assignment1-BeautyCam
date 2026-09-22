@@ -24,6 +24,15 @@ from core.effects.segment import (
 from core.infer import DEFAULT_SEGMENTER, SEGMENTER_SPECS
 from core.pipeline import Pipeline
 
+# 低光增强引擎选择（Phase 2：「经典 vs 深度」对比线）
+LOWLIGHT_CHOICES = [
+    ("关闭", "off"),
+    ("经典启发式（基线）", "heuristic"),
+    ("SCI 深度模型（推荐）", "sci"),
+]
+LOWLIGHT_SCI_LEVELS = [("轻度 easy", "easy"), ("中度 medium", "medium"),
+                       ("强力 difficult", "difficult")]
+
 # 背景图库缩略图尺寸
 BG_THUMB = (72, 41)
 
@@ -108,24 +117,167 @@ class BeautyPanel(QGroupBox):
         return lambda v: self.pipeline.set_params("beauty", **{key: v})
 
 
-class LowLightPanel(QGroupBox):
-    """低光增强（启发式版，Phase 2 换深度模型）。"""
+class AutoEnhancePanel(QGroupBox):
+    """自适应画质（Phase 4）：分区自动曝光 + CLAHE + 白平衡 + 饱和度。
+
+    全时段经典 DIP 校正（与低光增强互补：低光管极端暗光，本面板管
+    逆光脸黑 / 轻度过曝 / 偏色 / 发灰等常态问题）。人脸区域来自
+    FaceMesh 轮廓（美颜默认也在跑，零额外推理）。
+    """
 
     def __init__(self, pipeline: Pipeline, parent=None):
-        super().__init__("低光增强（启发式）", parent)
+        super().__init__("自适应画质", parent)
         self.pipeline = pipeline
-        effect = pipeline.get_effect("lowlight")
-        v = QVBoxLayout(self)
+        effect = pipeline.get_effect("autoenhance")
+        p = effect.get_params()
+
+        lay = QVBoxLayout(self)
         self.chk_enabled = QCheckBox("启用")
         self.chk_enabled.setChecked(effect.enabled)
+        self.chk_enabled.setToolTip(
+            "分区自动曝光（人脸优先）+ CLAHE 对比度 + 灰世界白平衡 + 饱和度，\n"
+            "统计量时域平滑防闪。全时段生效，与低光增强可叠加。")
         self.chk_enabled.toggled.connect(
-            lambda on: pipeline.set_enabled("lowlight", on))
+            lambda on: pipeline.set_enabled("autoenhance", on))
+        lay.addWidget(self.chk_enabled)
+
+        self.row_strength = SliderRow(
+            "总强度", 0.0, 1.0, p["strength"], self._set("strength"))
+        lay.addWidget(self.row_strength)
+        self.row_face = SliderRow(
+            "人脸曝光优先", 0.0, 1.0, p["face_exposure"],
+            self._set("face_exposure"))
+        self.row_face.setToolTip("人脸目标亮度从 115 插值到 150；0 = 全图统一曝光校正")
+        lay.addWidget(self.row_face)
+        self.row_contrast = SliderRow(
+            "对比度 (CLAHE)", 0.0, 1.0, p["contrast"], self._set("contrast"))
+        lay.addWidget(self.row_contrast)
+        self.row_color = SliderRow(
+            "白平衡", 0.0, 1.0, p["color"], self._set("color"))
+        self.row_color.setToolTip("灰世界假设，在背景区估计通道增益（避开肤色污染）")
+        lay.addWidget(self.row_color)
+        self.row_sat = SliderRow(
+            "饱和度", 0.0, 1.0, p["saturation"], self._set("saturation"))
+        lay.addWidget(self.row_sat)
+        self.row_smooth = SliderRow(
+            "时域平滑", 0.0, 0.95, p["smooth"], self._set("smooth"))
+        lay.addWidget(self.row_smooth)
+
+    def _set(self, key: str):
+        return lambda v: self.pipeline.set_params("autoenhance", **{key: v})
+
+
+class LowLightPanel(QGroupBox):
+    """低光增强（Phase 2）：经典启发式基线 / SCI 深度模型二选一。
+
+    管线里同时挂着两个 effect（name=lowlight / lowlight_dnn），面板下拉
+    谁就启用谁、另一个关闭（互斥）。客观对比数据见 scripts/eval_lowlight.py
+    （合成暗图上 SCI 22.1dB vs 启发式 14.4dB PSNR）。
+    """
+
+    def __init__(self, pipeline: Pipeline, parent=None):
+        super().__init__("低光增强", parent)
+        self.pipeline = pipeline
+
+        lay = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.addWidget(QLabel("引擎"), 0, 0)
+        self.cmb_engine = QComboBox()
+        for label, value in LOWLIGHT_CHOICES:
+            self.cmb_engine.addItem(label, value)
+        self.cmb_engine.setCurrentIndex(0)
+        self.cmb_engine.currentIndexChanged.connect(self._engine_changed)
+        grid.addWidget(self.cmb_engine, 0, 1)
+        lay.addLayout(grid)
+
+        self.lbl_level = QLabel("SCI 强度档")
+        self.cmb_level = QComboBox()
+        for label, value in LOWLIGHT_SCI_LEVELS:
+            self.cmb_level.addItem(label, value)
+        self.cmb_level.setCurrentIndex(1)   # medium 默认（评测最优档）
+        self.cmb_level.currentIndexChanged.connect(
+            lambda i: self.pipeline.set_params(
+                "lowlight_dnn", level=self.cmb_level.itemData(i)))
+        lay.addWidget(self.lbl_level)
+        lay.addWidget(self.cmb_level)
+
+        self.row_strength = SliderRow(
+            "增强强度", 0.0, 1.0, 1.0, self._set_strength)
+        lay.addWidget(self.row_strength)
+
         self.chk_auto = QCheckBox("仅暗光时自动增强（灰度均值 < 60）")
-        self.chk_auto.setChecked(effect.get_params()["auto"])
-        self.chk_auto.toggled.connect(
-            lambda on: pipeline.set_params("lowlight", auto=on))
-        v.addWidget(self.chk_enabled)
-        v.addWidget(self.chk_auto)
+        self.chk_auto.setChecked(True)
+        self.chk_auto.toggled.connect(self._set_auto)
+        lay.addWidget(self.chk_auto)
+
+        self._engine_changed()
+
+    # ------- 联动 -------
+
+    def _engine_changed(self, *_) -> None:
+        mode = self.cmb_engine.currentData()
+        self.pipeline.set_enabled("lowlight", mode == "heuristic")
+        self.pipeline.set_enabled("lowlight_dnn", mode == "sci")
+        sci = mode == "sci"
+        self.lbl_level.setVisible(sci)
+        self.cmb_level.setVisible(sci)
+
+    def _set_strength(self, v: float) -> None:
+        self.pipeline.set_params("lowlight", strength=v)
+        self.pipeline.set_params("lowlight_dnn", strength=v)
+
+    def _set_auto(self, on: bool) -> None:
+        self.pipeline.set_params("lowlight", auto=on)
+        self.pipeline.set_params("lowlight_dnn", auto=on)
+
+
+class HdrPanel(QGroupBox):
+    """自动 HDR 连拍（Phase 1，拍照模式）：EV 预设 + 色调映射 + 连拍按钮。
+
+    HDR 不进逐帧效果链（预览不受影响）；点「连拍融合」由 worker 在帧循环
+    顶部进入连拍节奏（0.12s 间隔采集自然抖动）→ ECC 对齐 → Mertens 融合。
+    成片与各 EV 原图、对照图一并存 photos/（验收要求）。
+    """
+
+    def __init__(self, on_capture: Callable[[str, object], None], parent=None):
+        super().__init__("自动 HDR 拍照", parent)
+        from core.effects.hdr import DEFAULT_EV_PRESET, EV_PRESETS
+
+        lay = QVBoxLayout(self)
+        grid = QGridLayout()
+        grid.addWidget(QLabel("包围曝光"), 0, 0)
+        self.cmb_evs = QComboBox()
+        for name in EV_PRESETS:
+            self.cmb_evs.addItem(name, name)
+        self.cmb_evs.setCurrentIndex(
+            max(0, self.cmb_evs.findData(DEFAULT_EV_PRESET)))
+        grid.addWidget(self.cmb_evs, 0, 1)
+        grid.addWidget(QLabel("色调映射"), 1, 0)
+        self.cmb_tonemap = QComboBox()
+        for label, value in (("关闭（Mertens 直出）", None),
+                             ("Drago（柔和高光）", "drago"),
+                             ("Reinhard（局部对比）", "reinhard")):
+            self.cmb_tonemap.addItem(label, value)
+        grid.addWidget(self.cmb_tonemap, 1, 1)
+        lay.addLayout(grid)
+
+        self.btn_burst = QPushButton("✨ HDR 连拍融合")
+        self.btn_burst.setObjectName("hdrBtn")
+        self.btn_burst.setEnabled(False)
+        self.btn_burst.setToolTip(
+            "连拍多张并以 gamma 曲线模拟包围曝光 → ECC 对齐 → Mertens 融合。\n"
+            "macOS 不支持手动包围曝光，用 gamma 模拟（效果等价、可复现）。")
+        self._on_capture = on_capture
+        self.btn_burst.clicked.connect(self._capture)
+        lay.addWidget(self.btn_burst)
+
+    def set_running(self, running: bool) -> None:
+        """相机启停联动（连拍需要活的采集源）。"""
+        self.btn_burst.setEnabled(running)
+
+    def _capture(self) -> None:
+        self._on_capture(self.cmb_evs.currentData(),
+                         self.cmb_tonemap.currentData())
 
 
 class SegmentPanel(QGroupBox):

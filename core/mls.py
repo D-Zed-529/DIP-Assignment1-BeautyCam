@@ -31,26 +31,18 @@ def identity_maps(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
     return mx, my
 
 
-def upsample_displacement_field(dx: np.ndarray, dy: np.ndarray,
+def upsample_displacement_dense(dx: np.ndarray, dy: np.ndarray,
                                 x1: int, y1: int, grid_step: int,
-                                h: int, w: int,
-                                x2: int | None = None,
-                                y2: int | None = None
+                                x2: int, y2: int
                                 ) -> tuple[np.ndarray, np.ndarray]:
-    """粗网格位移场 → 稠密 cv2.remap 采样图（MLS 与液化共用例程）。
+    """粗网格位移场 → ROI 内稠密采样图（不做全帧恒等图分配）。
 
-    dx/dy: 网格节点上的采样图偏移 (gh,gw)（map = v + offset，节点绝对
-    位置 = (x1+j·step, y1+i·step)；注意这是 remap 逆映射的采样偏移，
-    与内容位移反号）；
-    ROI = (x1, y1, x2, y2)（None 时取图像右/下边缘），ROI 外严格恒等。
-    稠密像素 j 必须严格采样网格节点 j/grid_step（不能用 cv2.resize：其
-    像素中心约定会系统性偏移 ~0.5 个节点，grid_step=6 时即 2.5px 内容
-    平移，锚点钉扎失效）。尾部覆盖不到 ROI 边缘时用"虚拟节点"补齐
-    （位置前进、位移=0）：若直接 clip 到末节点，map 的绝对位置在尾部
-    被冻结，位移会变成 末节点位置−x 的线性负斜坡（ROI 边缘假漂移）。
+    返回 (fx, fy)：shape (y2-y1, x2-x1) 的绝对采样坐标图（float32），
+    可直接用于 ROI 子图的 cv2.remap（需减去 ROI 原点偏移）。
+    节点对齐约定见 upsample_displacement_field 的 docstring。
     """
-    dense_w = (w if x2 is None else x2) - x1
-    dense_h = (h if y2 is None else y2) - y1
+    dense_w = x2 - x1
+    dense_h = y2 - y1
     need_c = int(np.ceil((dense_w - 1) / grid_step)) + 1
     need_r = int(np.ceil((dense_h - 1) / grid_step)) + 1
     pad_c = max(need_c - dx.shape[1], 0)
@@ -68,12 +60,34 @@ def upsample_displacement_field(dx: np.ndarray, dy: np.ndarray,
     kk_x, kk_y = np.meshgrid(kx, ky)
     up_kwargs = dict(interpolation=cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REPLICATE)
-    fx_up = cv2.remap(fx, kk_x, kk_y, **up_kwargs)
-    fy_up = cv2.remap(fy, kk_x, kk_y, **up_kwargs)
+    return (cv2.remap(fx, kk_x, kk_y, **up_kwargs),
+            cv2.remap(fy, kk_x, kk_y, **up_kwargs))
 
+
+def upsample_displacement_field(dx: np.ndarray, dy: np.ndarray,
+                                x1: int, y1: int, grid_step: int,
+                                h: int, w: int,
+                                x2: int | None = None,
+                                y2: int | None = None
+                                ) -> tuple[np.ndarray, np.ndarray]:
+    """粗网格位移场 → 全帧稠密 cv2.remap 采样图（MLS 与液化共用例程）。
+
+    dx/dy: 网格节点上的采样图偏移 (gh,gw)（map = v + offset，节点绝对
+    位置 = (x1+j·step, y1+i·step)；注意这是 remap 逆映射的采样偏移，
+    与内容位移反号）；
+    ROI = (x1, y1, x2, y2)（None 时取图像右/下边缘），ROI 外严格恒等。
+    稠密像素 j 必须严格采样网格节点 j/grid_step（不能用 cv2.resize：其
+    像素中心约定会系统性偏移 ~0.5 个节点，grid_step=6 时即 2.5px 内容
+    平移，锚点钉扎失效）。尾部覆盖不到 ROI 边缘时用"虚拟节点"补齐
+    （位置前进、位移=0）：若直接 clip 到末节点，map 的绝对位置在尾部
+    被冻结，位移会变成 末节点位置−x 的线性负斜坡（ROI 边缘假漂移）。
+    """
+    fx_up, fy_up = upsample_displacement_dense(
+        dx, dy, x1, y1, grid_step,
+        w if x2 is None else x2, h if y2 is None else y2)
     map_x, map_y = identity_maps(h, w)
-    map_x[y1:y1 + dense_h, x1:x1 + dense_w] = fx_up
-    map_y[y1:y1 + dense_h, x1:x1 + dense_w] = fy_up
+    map_x[y1:y1 + fx_up.shape[0], x1:x1 + fx_up.shape[1]] = fx_up
+    map_y[y1:y1 + fy_up.shape[0], x1:x1 + fy_up.shape[1]] = fy_up
     return map_x, map_y
 
 

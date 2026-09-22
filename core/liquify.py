@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .mls import GRID_STEP, identity_maps, upsample_displacement_field
+from .mls import (GRID_STEP, identity_maps, upsample_displacement_dense,
+                  upsample_displacement_field)
 
 
 def brush_falloff(t: np.ndarray) -> np.ndarray:
@@ -52,19 +53,27 @@ def brush_falloff(t: np.ndarray) -> np.ndarray:
 def rbf_liquify_maps(h: int, w: int,
                      P: np.ndarray, D: np.ndarray, radius: float,
                      weights: np.ndarray | None = None,
-                     grid_step: int = GRID_STEP
-                     ) -> tuple[np.ndarray, np.ndarray]:
+                     grid_step: int = GRID_STEP,
+                     return_roi: bool = False,
+                     ) -> tuple:
     """液化笔刷叠加位移场 → cv2.remap 采样图。
 
     P: (K,2) 控制点（像素坐标）；D: (K,2) 内容位移命令（保护点为 0，
     只进分母起衰减作用）；radius: 笔刷半径（像素，全点统一）；
     weights: (K,) 点权（默认全 1，保护点 >1）。
-    返回 (map_x, map_y)，支撑并集之外严格恒等。
+    默认返回 (map_x, map_y)：全帧采样图，支撑并集之外严格恒等。
+
+    return_roi=True 时返回 (map_x, map_y, roi)：map 仅 ROI 尺寸（ROI =
+    (x1,y1,x2,y2)，控制点包围盒外扩一个支撑半径），roi 为 None 表示
+    无变形。热路径（瘦脸）用这一档：720p 下全帧恒等图的分配+填充+
+    全帧 remap 约 5ms，脸围盒只占画面一角时可省 3~4ms；场在 ROI 边界
+    严格为 0（φ 紧支撑），ROI 内 remap 与全帧 remap 逐位一致（唯一
+    差异是 ROI 触帧边时的 REPLICATE 边缘，与全帧版行为相同）。
     """
     P = np.asarray(P, np.float64)
     D = np.asarray(D, np.float64)
     if len(P) == 0 or not np.any(D):
-        return identity_maps(h, w)
+        return (None, None, None) if return_roi else identity_maps(h, w)
     if weights is None:
         weights = np.ones(len(P))
     weights = np.asarray(weights, np.float64)
@@ -75,7 +84,15 @@ def rbf_liquify_maps(h: int, w: int,
     x2 = int(min(P[:, 0].max() + radius + 1, w))
     y2 = int(min(P[:, 1].max() + radius + 1, h))
     if x2 - x1 < 4 or y2 - y1 < 4:
-        return identity_maps(h, w)
+        return (None, None, None) if return_roi else identity_maps(h, w)
+
+    if return_roi:
+        # ROI 各边再外扩 1px：remap 边界像素的双线性插值需要界外 1px
+        # 邻居，子图裁掉后 REPLICATE 会顶替成边缘像素、与全帧 remap 差
+        # 1px 混合。外扩带在支撑边界之外（场恒为 0 → map 恒等），多算
+        # 的这圈是恒等区，代价可忽略。
+        x1, y1 = max(x1 - 1, 0), max(y1 - 1, 0)
+        x2, y2 = min(x2 + 1, w), min(y2 + 1, h)
 
     # ---- 粗网格求值：Shepard 归一化叠加 ----
     gx, gy = np.meshgrid(
@@ -91,4 +108,9 @@ def rbf_liquify_maps(h: int, w: int,
     dx = -(wgt @ D[:, 0]) / denom                        # (Gh,Gw)
     dy = -(wgt @ D[:, 1]) / denom
 
-    return upsample_displacement_field(dx, dy, x1, y1, grid_step, h, w, x2, y2)
+    if return_roi:
+        mx, my = upsample_displacement_dense(dx, dy, x1, y1, grid_step,
+                                             x2, y2)
+        return mx, my, (x1, y1, x2, y2)
+    return upsample_displacement_field(dx, dy, x1, y1, grid_step, h, w,
+                                       x2, y2)

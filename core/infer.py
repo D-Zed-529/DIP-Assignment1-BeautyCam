@@ -59,6 +59,19 @@ MODEL_FILES = {
     "selfie_segmenter": "selfie_multiclass_256x256.tflite",
 }
 
+# ------- Phase 2 低光增强（SCI，P2-1 定版依据见模块头新增记录） -------
+# SCI（Self-Calibrated Illumination, CVPR 2022）ONNX 化：54KB、固定 512×512
+# 输入、三档增强强度。实测（M4 / 720p 口径）：
+#   CPU 8.1ms/次 vs CoreML 1.6ms/次（5 倍，EP 真实生效，创建时打印实际 provider）
+# 输出两个张量：[0] 中间图、[1] 增强图（取 [1]，与官方 sample.py 一致）。
+LOWLIGHT_INPUT_SIZE = 512
+LOWLIGHT_LEVELS = {
+    "easy": "sci_easy_512x512.onnx",
+    "medium": "sci_medium_512x512.onnx",
+    "difficult": "sci_difficult_512x512.onnx",
+}
+LOWLIGHT_DEFAULT_LEVEL = "medium"
+
 DEFAULT_SEGMENTER = "selfie_segmenter_binary"
 
 # 分割模型 -> 建议的推理间隔帧数（虚拟背景的 SegmentEffect 据此设置隔帧降载）。
@@ -341,3 +354,69 @@ def get_engine() -> InferenceEngine:
             if _engine is None:
                 _engine = InferenceEngine()
     return _engine
+
+
+# ------- Phase 2：SCI 低光增强 ONNX 会话 -------
+
+def preprocess_sci(frame_bgr: np.ndarray, size: int = LOWLIGHT_INPUT_SIZE
+                   ) -> np.ndarray:
+    """帧 → SCI 输入张量 (1,3,size,size) float32。
+
+    固定尺寸模型：resize 到 size×size（纵横比畸变仅在推理域，输出会
+    resize 回原尺寸，畸变不进结果）；BGR→RGB、HWC→CHW、/255。
+    纯函数，供单测在无 onnxruntime 环境验证前处理口径。
+    """
+    x = cv2.resize(frame_bgr, (size, size), interpolation=cv2.INTER_AREA)
+    x = cv2.cvtColor(x, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return np.ascontiguousarray(x.transpose(2, 0, 1)[None])
+
+
+def postprocess_sci(out: np.ndarray) -> np.ndarray:
+    """SCI 输出张量 (1,3,S,S) → RGB float32 图 (S,S,3)，clip 到 [0,1]。"""
+    return np.clip(out[0].transpose(1, 2, 0), 0.0, 1.0)
+
+
+class LowLightSession:
+    """SCI 低光增强会话（CoreML EP 优先、CPU 回退，创建即打印实际 provider）。
+
+    与 MediaPipe 引擎分开放：生命周期独立（低光关掉时可释放）、模型按
+    level 三选一。线程约定：只在工作线程 process 内使用（同 engine）。
+    """
+
+    def __init__(self, level: str = LOWLIGHT_DEFAULT_LEVEL,
+                 models_dir: Path | str = MODELS_DIR):
+        if level not in LOWLIGHT_LEVELS:
+            raise ValueError(f"未知 SCI 强度档：{level}，应为 "
+                             f"{tuple(LOWLIGHT_LEVELS)} 之一")
+        import onnxruntime as ort   # 局部 import：无 onnxruntime 的环境仍可用其余功能
+        path = Path(models_dir) / LOWLIGHT_LEVELS[level]
+        if not path.exists():
+            raise FileNotFoundError(
+                f"模型缺失：{path}，请先运行 python scripts/download_models.py")
+        wanted = [p for p in ("CoreMLExecutionProvider", "CPUExecutionProvider")
+                  if p in ort.get_available_providers()]
+        self.level = level
+        self.sess = ort.InferenceSession(str(path), providers=wanted)
+        self.input_name = self.sess.get_inputs()[0].name
+        # ⚠️ 防静默回退（AGENTS.md）：创建后必须记录并打印实际生效 provider
+        self.provider = self.sess.get_providers()[0]
+        print(f"[低光 SCI] 会话就绪：{level} 档 512×512，"
+              f"实际 EP = {self.provider}（候选 {wanted}）")
+
+    def enhance(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """整帧增强（512×512 推理坐标域），返回 RGB float32 (512,512,3)。"""
+        x = preprocess_sci(frame_bgr)
+        out = self.sess.run(None, {self.input_name: x})
+        return postprocess_sci(out[1])   # [1] 是增强图（[0] 为中间量）
+
+
+_lowlight_sessions: dict[str, LowLightSession] = {}
+_lowlight_lock = threading.Lock()
+
+
+def get_lowlight_session(level: str = LOWLIGHT_DEFAULT_LEVEL) -> LowLightSession:
+    """SCI 会话按 level 缓存（GUI 切档时复用/重建）。"""
+    with _lowlight_lock:
+        if level not in _lowlight_sessions:
+            _lowlight_sessions[level] = LowLightSession(level)
+        return _lowlight_sessions[level]

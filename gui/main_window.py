@@ -22,28 +22,37 @@ from PySide6.QtWidgets import (
 )
 
 from core.camera import LiveCamera, VideoFileSource
+from core.effects.autoenhance import AutoEnhanceEffect
 from core.effects.beauty import BeautyEffect
-from core.effects.lowlight import LowLightEffect
+from core.effects.lowlight import LowLightDnnEffect, LowLightEffect
 from core.effects.segment import SegmentEffect
 from core.infer import SEGMENTER_INTERVAL, get_engine
 from core.pipeline import Pipeline
 from gui.panels import (
-    BeautyPanel, CapturePanel, LowLightPanel, SegmentPanel,
+    AutoEnhancePanel, BeautyPanel, CapturePanel, HdrPanel, LowLightPanel,
+    SegmentPanel,
 )
-from gui.workers import CameraWorker, PHOTOS_DIR
+from gui.workers import CameraWorker, DISPLAY_SIZE, PHOTOS_DIR
 
 RECENT_PHOTOS = 4          # 预览条缩略图数量（一期口径）
 THUMB_SIZE = (152, 100)    # 缩略图尺寸
-VIDEO_VIEW = (960, 540)    # 视频显示区逻辑尺寸
+VIDEO_VIEW = DISPLAY_SIZE  # 视频显示区逻辑尺寸（与 worker 预缩放一致）
 
 
 def ndarray_to_pixmap(frame_bgr: np.ndarray, size: tuple[int, int]) -> QPixmap:
-    """BGR ndarray -> 等比缩放 QPixmap。"""
+    """BGR ndarray -> 等比缩放 QPixmap（缩略图等小图用；视频帧走零缩放路径）。"""
     h, w = frame_bgr.shape[:2]
     img = QImage(frame_bgr.data, w, h, 3 * w, QImage.Format.Format_BGR888)
     pix = QPixmap.fromImage(img)
     return pix.scaled(*size, Qt.AspectRatioMode.KeepAspectRatio,
                       Qt.TransformationMode.SmoothTransformation)
+
+
+def frame_to_pixmap(frame_bgr: np.ndarray) -> QPixmap:
+    """worker 预缩放后的帧 -> QPixmap（零缩放，主线程只剩包装开销）。"""
+    h, w = frame_bgr.shape[:2]
+    img = QImage(frame_bgr.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+    return QPixmap.fromImage(img)
 
 
 class PhotoDialog(QDialog):
@@ -75,14 +84,16 @@ class PhotoDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BeautyCam v2")
-        self.resize(1280, 760)
+        self.setWindowTitle("BeautyCam v2 — 多效果实时相机")
+        self.resize(1360, 800)
 
-        # 管线：低光增强 → 美颜 → 人像虚化/背景替换（HDR 为拍照模式，不进逐帧链）
-        # 顺序对齐 PLAN §3.2。背景替换放链末：合成边界不再被后续效果处理，
-        # 人像与新背景的接缝保持干净（掩膜与美颜的几何耦合见 core/effects/segment.py）
+        # 管线：自适应画质（链首，先校正曝光/色调，低光的暗光判定看到的是
+        # 校正后的亮度）→ 低光（启发式/SCI 互斥，默认都关）→ 美颜 → 虚化/替换。
+        # 顺序对齐 PLAN §3.2；HDR 是拍照模式不进链（gui/workers.py 连拍）。
         self.pipeline = Pipeline([
+            AutoEnhanceEffect(enabled=False),
             LowLightEffect(enabled=False),
+            LowLightDnnEffect(enabled=False),
             BeautyEffect(enabled=True),
             SegmentEffect(enabled=False),
         ])
@@ -101,8 +112,32 @@ class MainWindow(QMainWindow):
         central = QWidget(objectName="root")
         self.setCentralWidget(central)
         root_lay = QVBoxLayout(central)
+        root_lay.setSpacing(10)
+
+        # ---- 顶部 header：标题 + 实时状态徽章 ----
+        header = QWidget(objectName="header")
+        hlay = QHBoxLayout(header)
+        title = QLabel("BeautyCam v2")
+        title.setObjectName("appTitle")
+        subtitle = QLabel("DIP 课程项目 · 美颜 / 虚化 / HDR / 低光增强")
+        subtitle.setObjectName("appSubtitle")
+        hlay.addWidget(title)
+        hlay.addWidget(subtitle)
+        hlay.addStretch(1)
+        self.badge_dark = QLabel("暗光")
+        self.badge_dark.setObjectName("badgeWarn")
+        self.badge_dark.setToolTip("低光增强生效中（亮度 < 阈值）")
+        self.badge_dark.hide()
+        self.badge_faces = QLabel("人脸 0")
+        self.badge_faces.setObjectName("badge")
+        self.badge_fps = QLabel("-- fps")
+        self.badge_fps.setObjectName("badge")
+        for b in (self.badge_dark, self.badge_faces, self.badge_fps):
+            hlay.addWidget(b)
+        root_lay.addWidget(header)
 
         top = QHBoxLayout()
+        top.setSpacing(10)
         root_lay.addLayout(top, stretch=1)
 
         self.video_label = QLabel("尚未开启相机")
@@ -113,7 +148,7 @@ class MainWindow(QMainWindow):
 
         top.addWidget(self._build_control_panel())
 
-        # 拍照预览条
+        # ---- 拍照预览条 ----
         preview = QGroupBox("拍照预览（点击放大）")
         strip = QHBoxLayout(preview)
         for i in range(RECENT_PHOTOS):
@@ -135,7 +170,7 @@ class MainWindow(QMainWindow):
 
     def _build_control_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(320)
+        panel.setFixedWidth(330)
         lay = QVBoxLayout(panel)
         lay.setSpacing(10)
 
@@ -150,7 +185,7 @@ class MainWindow(QMainWindow):
         btn_video.clicked.connect(self._pick_video)
         src_lay.addWidget(btn_video, 1, 0, 1, 2)
         self.btn_toggle = QPushButton("开始")
-        self.btn_toggle.setObjectName("dangerBtn")
+        self.btn_toggle.setObjectName("primaryBtn")
         self.btn_toggle.clicked.connect(self._toggle_camera)
         src_lay.addWidget(self.btn_toggle, 2, 0, 1, 2)
         self.selected_video: Optional[str] = None
@@ -158,10 +193,14 @@ class MainWindow(QMainWindow):
 
         self.beauty_panel = BeautyPanel(self.pipeline)
         lay.addWidget(self.beauty_panel)
+        self.autoenhance_panel = AutoEnhancePanel(self.pipeline)
+        lay.addWidget(self.autoenhance_panel)
         self.lowlight_panel = LowLightPanel(self.pipeline)
         lay.addWidget(self.lowlight_panel)
         self.segment_panel = SegmentPanel(self.pipeline, self._on_model_change)
         lay.addWidget(self.segment_panel)
+        self.hdr_panel = HdrPanel(self._hdr_capture)
+        lay.addWidget(self.hdr_panel)
         self.capture_panel = CapturePanel(self._manual_capture)
         lay.addWidget(self.capture_panel)
 
@@ -193,7 +232,11 @@ class MainWindow(QMainWindow):
         self.worker.source_finished.connect(self._on_source_finished)
         self.worker.failed.connect(self._on_worker_failed)
         self.btn_toggle.setText("停止")
+        self.btn_toggle.setObjectName("dangerBtn")
+        self.btn_toggle.style().unpolish(self.btn_toggle)
+        self.btn_toggle.style().polish(self.btn_toggle)
         self.capture_panel.btn_capture.setEnabled(True)
+        self.hdr_panel.set_running(True)
         self.worker.start()
 
     def _stop_worker(self) -> None:
@@ -201,22 +244,39 @@ class MainWindow(QMainWindow):
             self.worker.stop()
             self.worker = None
         self.btn_toggle.setText("开始")
+        self.btn_toggle.setObjectName("primaryBtn")
+        self.btn_toggle.style().unpolish(self.btn_toggle)
+        self.btn_toggle.style().polish(self.btn_toggle)
         self.capture_panel.btn_capture.setEnabled(False)
+        self.hdr_panel.set_running(False)
         self.video_label.setText("相机已停止")
+        self.badge_fps.setText("-- fps")
         self.statusBar().showMessage("相机已停止")
 
     # ---------------- 信号槽（主线程） ----------------
 
     def _on_frame(self, frame: np.ndarray) -> None:
-        self.video_label.setPixmap(ndarray_to_pixmap(frame, VIDEO_VIEW))
+        # worker 已按显示尺寸预缩放：主线程零缩放，只做 QImage 包装
+        self.video_label.setPixmap(frame_to_pixmap(frame))
 
     def _on_face_count(self, n: int) -> None:
         self._last_faces = n
+        self.badge_faces.setText(f"人脸 {n}")
 
     def _on_fps(self, fps: float) -> None:
-        lowlight = self.pipeline.get_effect("lowlight")
-        dark = " · 暗光增强中" if (lowlight.enabled and lowlight.is_dark) else ""
-        self.statusBar().showMessage(f"{fps:5.1f} fps · 人脸 {self._last_faces}{dark}")
+        self.badge_fps.setText(f"{fps:5.1f} fps")
+        # 档位变化才切换样式（每帧 polish/unpolish 会让主线程做无谓的重绘）
+        tier = ("badgeOk" if fps >= 24 else
+                "badgeWarn" if fps >= 14 else "badgeBad")
+        if tier != self.badge_fps.objectName():
+            self.badge_fps.setObjectName(tier)
+            self.badge_fps.style().unpolish(self.badge_fps)
+            self.badge_fps.style().polish(self.badge_fps)
+        low_heur = self.pipeline.get_effect("lowlight")
+        low_dnn = self.pipeline.get_effect("lowlight_dnn")
+        dark = ((low_heur.enabled and low_heur.is_dark)
+                or (low_dnn.enabled and low_dnn.is_dark))
+        self.badge_dark.setVisible(dark)
 
     def _on_photo_saved(self, path: str) -> None:
         QApplication.beep()   # 快门提示音（一期 root.bell 等价物）
@@ -276,6 +336,14 @@ class MainWindow(QMainWindow):
         # 触发器复选框变化同步给 worker（collection 赋值原子，无需锁）
         if self.worker is not None:
             self.worker.triggers = self.capture_panel.triggers()
+
+    def _hdr_capture(self, ev_preset: str, tonemap: object) -> None:
+        """HDR 连拍入口（HdrPanel 回调；tonemap None=直出 Mertens）。"""
+        if self.worker is None or not self.worker.isRunning():
+            self.statusBar().showMessage("先「开始」相机再连拍 HDR")
+            return
+        self.worker.triggers = self.capture_panel.triggers()
+        self.worker.request_hdr_capture(ev_preset, tonemap)
 
     def _on_model_change(self, key: str) -> None:
         """切换分割模型：会话重建交给工作线程，同时同步隔帧间隔。

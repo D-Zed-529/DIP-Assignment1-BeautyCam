@@ -2,7 +2,7 @@
 
 数字图像处理（DIP）课程小组项目：基于 **Python + OpenCV + MediaPipe** 的桌面端实时美颜相机，支持手势 / 笑脸触发自动拍照。
 
-**当前版本：v2（Phase 0 底座 + Phase 3 虚拟背景已完成）** —— core/gui 分层架构 + PySide6 界面 + 效果链插件模式；一期 Tkinter 版归档于 `legacy/`。
+**当前版本：v2（Phase 0/1/2/3/4 功能开发完成，Phase 5 评测数据就绪）** —— core/gui 分层架构 + PySide6 界面 + 效果链插件模式；一期 Tkinter 版归档于 `legacy/`。
 
 ## v2 已实现功能
 
@@ -13,7 +13,10 @@
 | 统一推理 | `core/infer.py`：MediaPipe **Tasks API** 单例会话（FaceMesh468+blendshapes / Hands21 / 自拍分割），每帧一次推理结果放 `FrameContext` 共享，效果内部禁止重复推理 |
 | 美颜（全参数化） | ① 双边滤波磨皮（混合比可调）② LAB 美白（默认**全身肤色**，含脖子/手臂；可切"仅脸部"=肤色∧轮廓掩膜；软 alpha 无硬边）③ 瘦脸（下颌链 liquify 内收，**真变形**，方向/作用域已修正）④ 大眼（remap 向量化 + 边缘羽化，替代一期逐像素循环）⑤ 收尾锐化 |
 | **人像虚化 / 背景替换（Phase 3）** | `core/effects/segment.py`：三档模式（**背景虚化 / 换背景图 / 纯色**，对齐腾讯会议虚拟背景）。人像掩膜 = 二元自拍分割 → 运动自适应 EMA 时域平滑（静止防抖、运动防拖影）→ **guided filter 边缘精修**（自实现 He et al. 2010，边缘最大梯度提升约 4 倍）；内置 10 张程序化背景图库 + 用户自选图片 + 纯色预设。实测效果本体 15.2ms/帧 |
-| 低光增强 | 一期启发式迁移为效果模块（自动/手动、强度可调）；Phase 2 将替换为 SCI/Zero-DCE++ ONNX |
+| 低光增强（Phase 2） | 双引擎可切：**SCI 深度模型**（CVPR 2022，ONNX 54KB、固定 512×512 推理 + 上采样、easy/medium/difficult 三档、隔帧复用降载、亮度自动触发；CoreML EP 实测 1.7ms/次 vs CPU 7.4ms，**4.3 倍**，合成暗图 PSNR 22.1dB 启发式 14.4dB）与一期启发式基线（线性增益+直方图均衡）共存，构成"经典 vs 深度"对比线 |
+| **自适应画质优化** | `core/effects/autoenhance.py`：全时段经典 DIP 画面校正（与低光增强互补——本效果管逆光脸黑/轻度过曝/偏色/发灰等常态问题）。**FaceMesh 轮廓分区统计**直方图 → 人脸/背景各自 gamma 自动曝光（目标 150/115，容差带防抖，幂变换 LUT 按软掩膜混合）→ CLAHE 对比度 → **灰世界白平衡**（背景区估计，避开肤色污染）→ LAB 饱和度；统计量参数级 EMA 时域平滑防闪。人脸区域复用美颜的 FaceMesh 推理，零额外模型；实测效果本体 14.6ms/帧 |
+| **自动 HDR 拍照（Phase 1）** | `core/effects/hdr.py`：连拍（0.12s 间隔采集自然抖动）→ gamma LUT 模拟包围曝光（macOS 不支持手动曝光的关键绕坑决策）→ findTransformECC 帧间对齐 → MergeMertens 融合 → 可选 Drago/Reinhard 色调映射；成片/各 EV 原图/对照图一并存档 |
+| **换脸（演示级，Phase 4）** | `demos/faceswap/`：FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → seamlessClone 泊松融合 → Reinhard 色彩迁移；**每阶段中间产物存图**（课堂讲解素材）；CLI `--consent` 强制伦理确认（仅本人/授权/动漫形象） |
 | 手势拍照 | 剪刀手判定不变（食指+中指伸直、夹角 15°–65°），**改用墙钟时间持续 1s 判定**（一期帧计数在帧率波动时不稳） |
 | 笑脸拍照 | FaceBlendshapes `mouthSmile` 置信度 > 0.45 持续 0.5s（比一期嘴部张合更抗头姿干扰），缺失时自动回退一期口径 |
 | GUI | PySide6 暗色主题：视频区 + 效果面板（开关/滑杆）+ 采集源选择（摄像头/视频文件）+ 拍照预览条（点击放大）+ 状态栏 FPS |
@@ -29,19 +32,22 @@
 ├── core/                  # 处理核心（禁止 import GUI 库）
 │   ├── camera.py          #   采集源抽象：相机 / 视频 / 图片序列
 │   ├── context.py         #   FrameContext：每帧共享推理结果
-│   ├── infer.py           #   MediaPipe Tasks 单例会话（CPU 委托）
+│   ├── infer.py           #   MediaPipe Tasks 单例会话 + SCI 低光 ONNX 会话（CoreML EP）
 │   ├── gestures.py        #   V 手势/笑脸判定 + 自动拍照状态机
 │   ├── pipeline.py        #   Effect 基类 + 有序效果链（线程安全参数 + 隔帧降载）
-│   └── effects/           #   beauty.py / lowlight.py / segment.py（hdr 后续阶段）
+│   └── effects/           #   beauty.py / lowlight.py（启发式+SCI）/ segment.py / hdr.py
 ├── gui/                   # PySide6 界面
 │   ├── main_window.py     #   主窗口（python -m gui.main_window）
-│   ├── panels.py          #   效果控制面板（开关+滑杆+图库选择器）
-│   ├── workers.py         #   QThread 相机工作线程（信号发帧）
-│   └── theme.qss          #   暗色主题
+│   ├── panels.py          #   效果控制面板（美颜/低光/虚化/HDR/拍照）
+│   ├── workers.py         #   QThread 相机工作线程（信号发帧 + HDR 连拍）
+│   └── theme.qss          #   暗色主题（卡片化 + 徽章体系）
+├── demos/faceswap/        # 换脸演示（Delaunay+泊松，过程可视化，--consent 伦理门）
 ├── scripts/
-│   ├── download_models.py #   拉取 MediaPipe 模型到 models/
+│   ├── download_models.py #   拉取 MediaPipe + SCI 模型到 models/
 │   ├── make_backgrounds.py#   程序化生成虚拟背景图库（无版权风险）
-│   └── run_pipeline.py    #   headless 批跑 CLI
+│   ├── run_pipeline.py    #   headless 批跑 CLI
+│   ├── bench.py           #   性能基准（各功能分解 + CPU vs CoreML 对比）
+│   └── eval_lowlight.py   #   低光增强 PSNR/SSIM 客观评测
 ├── tests/                 # 纯函数单测（不依赖摄像头/GUI）
 ├── assets/samples/        # 测试样例图
 ├── assets/backgrounds/    # 虚拟背景图库（10 张，程序化生成）
@@ -79,6 +85,20 @@ python scripts/make_backgrounds.py
 python scripts/run_pipeline.py --input assets/samples --output outputs/
 python scripts/run_pipeline.py --input 某视频.mp4 --no-beauty --lowlight --max-frames 100
 
+# SCI 深度低光增强（Phase 2 主力档）
+python scripts/run_pipeline.py --input assets/samples --no-beauty \
+    --lowlight-dnn --lowlight-level medium --lowlight-force
+
+# 换脸演示（Phase 4；--consent 为伦理确认门，详见 demos/faceswap/README.md）
+python -m demos.faceswap.faceswap --src 源脸.jpg --dst 目标.jpg \
+    --out outputs/faceswap --consent
+
+# 低光客观评测（PSNR/SSIM：SCI vs 启发式 vs 不增强）
+python scripts/eval_lowlight.py --input assets/samples --save-compare
+
+# 性能基准（各功能耗时分解 + SCI 的 CPU vs CoreML 对比）
+python scripts/bench.py --markdown-out outputs/bench.md
+
 # 虚拟背景：换背景图 / 背景虚化 / 纯色
 python scripts/run_pipeline.py --input assets/samples --segment \
     --seg-mode image --seg-bg assets/backgrounds/02_冷色渐变.jpg
@@ -114,34 +134,32 @@ python scripts/run_pipeline.py --input assets/samples --segment --seg-mode color
 - **不要依赖 `cv2.ximgproc`**：项目主目标的 macOS 上 opencv-python 不含 contrib。guided filter 已自实现（纯 `cv2.boxFilter`，与 ximgproc 版本数值一致到 1e-5）。
 - **不要用 `cv2.imread`/`cv2.imwrite` 读写非 ASCII 路径**：Windows 上 `imread` 静默返回 `None`、`imwrite` 会**写到乱码文件名**且不报错。统一走 `np.fromfile`/`Path.write_bytes` + `cv2.imdecode`/`cv2.imencode`（见 `core/effects/segment.py::load_image`）。
 
-## 性能基线（1280×720，2026-09 实测）
+## 性能基线（1280×720，2026-09 实测，Apple M4）
 
-Apple M4（PLAN 的验收口径）：
+**美颜链性能优化（Phase 5）**：磨皮双边滤波降半分辨率（5.0→1.6ms）、肤色掩膜半分辨率（1.3→0.6ms）、美白 boundingRect 定位（3.1→0.8ms）、瘦脸 ROI remap（5.7→2.4ms，与全帧逐位一致有单测锁定）、亮度检测缩略图（0.4→0.1ms）——**美颜全链 18.4→9.4ms（1.96 倍）**，且全部不改数值结果（逐位等价）。
 
-| 链路 | 均摊耗时 | FPS |
-|------|---------|-----|
-| FaceMesh 推理 + 美颜（默认参数） | ~18 ms/帧 | ~55 |
-| FaceMesh + Hands + 美颜（手势模式全开） | ~30 ms/帧 | ~34 |
+| 链路 | 优化前 | 优化后 |
+|------|---------|--------|
+| 美颜全链（含 FaceMesh） | 26.6 ms（37.6 fps） | **17.6 ms（56.8 fps）** |
+| 美颜 + 虚化 | 41.6 ms（24.0 fps） | **36.3 ms（27.6 fps）** |
+| 美颜 + 虚化 + 低光 | 43.7 ms（22.9 fps） | **35.4 ms（28.3 fps）** |
 
-Windows x86（本次 Phase 3 开发机）：
+GUI 另有 worker 侧预缩放（帧在 worker 线程缩到显示尺寸，主线程零缩放，只做 QImage 包装）。
 
-| 链路 | 均摊耗时 | FPS |
-|------|---------|-----|
-| 基线：人脸 + 手势 + 美颜 + 低光（**不开虚拟背景**） | 38.0 ms/帧 | 26.3 |
-| 三开：低光 + 美颜 + 背景替换（其中背景替换 15.2ms） | 72.4 ms/帧 | 13.8 |
+**推理分解**：FaceMesh 8.3ms / Hands 12.5ms（按需才跑）/ 分割二元 9.1ms / SCI 低光 CoreML **1.7ms** vs CPU 7.4ms（4.3 倍）。
 
 分割模型选型对比：二元 13.2ms/帧（每帧可跑）vs 多分类 155ms/帧（必须隔帧，已实现通用 `inference_interval` 隔帧降载机制）。
 
-> 本机比 M4 慢约一倍（同配置基线 26.3 vs 55 fps），Phase 3 的 ≥15fps 验收线在 M4 上应有余量。若要进一步提高，最有效的杠杆是把送入分割器的帧降采样（二元模型 480p 实测 7.5ms vs 720p 13.4ms，代价是掩膜尺寸契约变化）。
+低光增强客观评测（合成暗图，`scripts/eval_lowlight.py`）：**SCI-medium 22.1dB / SSIM 0.860** vs 启发式 14.4dB / 0.753 vs 不增强 6.7dB / 0.466。
 
-## 二期计划（Phase 1–5 进行中）
+## 二期计划收尾状态
 
 v2 定位为**多效果实时相机系统**，详见 [docs/PLAN.md](docs/PLAN.md) 与 [TODO.md](TODO.md)：
 
-- **自动 HDR 拍照**（P1）：gamma 模拟包围曝光 + Mertens 融合（经典线），可选单帧深度 HDR 对比线
-- **低光增强**（P2）：SCI / Zero-DCE++（ONNX，CoreML EP）替换现有启发式增强
-- ~~**人像虚化 / 背景替换**（P3）~~：**已完成**（三档模式 + 边缘精修 + 程序化背景图库）；进阶档深度渐进虚化（P3-4，Depth Anything V2）待做
-- **换脸（演示级）**（P4）：Delaunay 剖分 + 泊松融合，主打过程可视化；仅限本人/授权/动漫形象
-- **GPU 加速与评测**（P5）：ONNX Runtime CoreML EP + 性能对比基准 + 答辩材料
+- ~~**自动 HDR 拍照**（P1）~~：**已完成**（gamma 模拟包围曝光 + ECC 对齐 + Mertens + tonemap + 连拍存档）
+- ~~**低光增强**（P2）~~：**已完成**（SCI ONNX 定版，CoreML EP，双引擎可切）
+- ~~**人像虚化 / 背景替换**（P3）~~：**已完成**（三档模式 + 边缘精修 + 程序化背景图库）；进阶档深度渐进虚化（P3-4，Depth Anything V2）未做
+- ~~**换脸（演示级）**（P4）~~：**已完成**（Delaunay + 泊松融合 + 过程可视化 + `--consent` 伦理门）；P4-3 实时版为可选项未做
+- **GPU 加速与评测**（P5）：CoreML EP 已启用并验证（SCI 4.3 倍）、性能基准脚本（`bench.py`）与低光客观评测（`eval_lowlight.py`）就绪；主观问卷与 PPT 由小组线下完成
 
 > 硬件部分（STM32F103 + LED 指示灯联动）的代码不在本仓库，PPT 中的相关内容为另一条交付线。

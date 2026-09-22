@@ -6,3 +6,6 @@ numpy==1.26.4
 opencv-python==4.11.0.86
 PySide6==6.11.2
 pillow==12.3.0
+# Phase 2 低光增强 SCI 的 ONNX 推理（CoreML EP 优先，CPU 回退；
+# 版本联动坑见 AGENTS.md #6——升级 numpy/mediapipe/opencv 前先跑全量单测）
+onnxruntime==1.30.0
