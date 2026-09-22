@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import os
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -31,6 +32,9 @@ def mean_brightness(frame_bgr: np.ndarray) -> float:
 
 class CameraSource(ABC):
     """采集源基类。帧一律为 BGR ndarray。"""
+
+    # 实时源（相机）读帧失败时重试而非结束；文件/序列源读尽即结束
+    continuous: bool = False
 
     @abstractmethod
     def open(self) -> bool:
@@ -58,7 +62,20 @@ class CameraSource(ABC):
 
 
 class LiveCamera(CameraSource):
-    """实时摄像头。固定 1280×720，默认镜像（自拍语义）。"""
+    """实时摄像头。固定 1280×720，默认镜像（自拍语义）。
+
+    macOS 坑（本机实测）：
+      - 摄像头权限（TCC）未授予宿主终端应用时 isOpened() 直接 False，
+        stderr 出现 "not authorized to capture video"（打开失败的主因）；
+      - 授权后首次 open 也可能初始化不完全，需要重试几次；
+      - 前几帧常为空（AVFoundation 会话启动中），read() 需预热。
+    """
+
+    # open() 失败后的重试次数与间隔（授权弹窗确认存在竞态窗口）
+    OPEN_RETRIES = 3
+    OPEN_RETRY_DELAY = 0.8
+    WARMUP_READS = 5          # open 后预读帧数（丢掉启动空帧）
+    continuous = True          # 实时源：偶发空帧重试而非结束
 
     def __init__(self, index: int = 0, mirror: bool = True,
                  width: int = CAP_WIDTH, height: int = CAP_HEIGHT):
@@ -67,23 +84,39 @@ class LiveCamera(CameraSource):
         self.width = width
         self.height = height
         self._cap: Optional[cv2.VideoCapture] = None
+        self.last_error: str = ""
 
     def open(self) -> bool:
-        # AVFoundation 后端显式指定，避免 OpenCV 误选其他后端
-        self._cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
-        if not self._cap.isOpened():
-            return False
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        # 曝露参数保持自动：macOS 上手动曝光不可控（见 PLAN §2 绕坑决策），
-        # 一期曾设置的 CAP_PROP_EXPOSURE 在 AVFoundation 下无效且可能干扰
-        return True
+        for attempt in range(self.OPEN_RETRIES):
+            # AVFoundation 后端显式指定，避免 OpenCV 误选其他后端
+            cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+            if not cap.isOpened():
+                cap.release()
+                self.last_error = (
+                    f"摄像头#{self.index} 打不开（第 {attempt + 1} 次）。"
+                    "最常见原因是 macOS 未授权：系统设置 → 隐私与安全性 → 摄像头，"
+                    "勾选运行 Python 的终端应用（Terminal/iTerm/VS Code 等）后重试。")
+                time.sleep(self.OPEN_RETRY_DELAY)
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # 预热：AVFoundation 会话启动中前几帧为空
+            for _ in range(self.WARMUP_READS):
+                ret, _ = cap.read()
+                if ret:
+                    break
+                time.sleep(0.1)
+            self._cap = cap
+            self.last_error = ""
+            return True
+        return False
 
     def read(self) -> tuple[bool, Optional[np.ndarray]]:
         if self._cap is None:
             return False, None
         ret, frame = self._cap.read()
         if not ret or frame is None:
+            # 偶发空帧（自动对焦/曝光切换）不视为致命，交由上层重试
             return False, None
         if self.mirror:
             frame = cv2.flip(frame, 1)

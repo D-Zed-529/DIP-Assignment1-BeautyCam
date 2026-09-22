@@ -78,7 +78,8 @@ class CameraWorker(QThread):
 
     def run(self) -> None:
         if not self.source.open():
-            self.failed.emit(f"无法打开采集源：{self.source.name}")
+            detail = getattr(self.source, "last_error", "")
+            self.failed.emit(f"无法打开采集源：{self.source.name}\n{detail}".strip())
             return
         self.status_message.emit(f"已打开 {self.source.name}")
         try:
@@ -89,11 +90,22 @@ class CameraWorker(QThread):
             self.source.release()
 
     def _loop(self) -> None:
+        empty_streak = 0          # 连续空帧计数（实时源偶发空帧用）
         while not self._stop_flag:
             ret, frame = self.source.read()
             if not ret or frame is None:
+                if self.source.continuous:
+                    # 实时相机偶发空帧（对焦/曝光切换）：退避重试，连败才算故障
+                    empty_streak += 1
+                    if empty_streak > 150:   # ~15s 无帧视为设备故障
+                        self.failed.emit(
+                            f"{self.source.name} 持续无帧，设备可能被占用或已断开")
+                        break
+                    time.sleep(0.1)
+                    continue
                 self.source_finished.emit()
                 break
+            empty_streak = 0
 
             # 统一推理：效果链需求 ∨ 手势触发需求
             needs = self.pipeline.infer_needs()
