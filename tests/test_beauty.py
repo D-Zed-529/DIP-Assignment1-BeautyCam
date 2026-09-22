@@ -160,7 +160,7 @@ class TestEnlargeEyes(unittest.TestCase):
     def test_disabled_at_large_yaw(self):
         frame = synth_face_frame()
         lm = self._spread_eyes(synth_face_landmarks(frame))
-        out = enlarge_eyes(frame, lm, strength=0.3, yaw_deg=40.0)
+        out = enlarge_eyes(frame, lm, strength=0.3, yaw_deg=B.YAW_ZERO_DEG)
         self.assertTrue(np.array_equal(out, frame))
 
     def test_squint_eye_skipped(self):
@@ -351,7 +351,7 @@ class TestPoseGate(unittest.TestCase):
     def test_slim_disabled_at_large_yaw(self):
         frame = synth_face_frame()
         lm = synth_face_landmarks(frame)
-        out = slim_face(frame, lm, strength=1.0, yaw_deg=40.0)
+        out = slim_face(frame, lm, strength=1.0, yaw_deg=B.YAW_ZERO_DEG)
         self.assertTrue(np.array_equal(out, frame))
 
     def test_slim_far_side_suppressed(self):
