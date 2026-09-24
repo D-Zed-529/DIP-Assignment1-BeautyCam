@@ -70,6 +70,7 @@
 36. **实时采集与推理并行**：`LiveCamera` 独立线程持续读取设备，`read()` 只返回最新未消费帧，处理慢时丢过期帧以降低预览延迟；释放设备前先停止采集线程。Torch 人脸/手部关键点及标量结果打包一次 D2H，worker 整帧走 `torch.inference_mode()`。并发采集改善新鲜度，不能把计算受限的效果链 fps 直接翻倍。
 37. **同帧独立模型并发**：`TorchInferenceEngine.process` 在 CUDA 上用常驻线程池与独立 stream 并发执行人脸、手、分割、深度中实际请求的模型；单模型帧直跑。上传 RGB 后子 stream 等待源 stream，返回前同步各 stream；RVM/跟踪/深度时域状态仍按帧顺序更新，勿将连续帧并发。540p 人脸+RVM 实测整入口约 12→9ms；9×9 磨皮滤波切 2/4 块虽无误差，却因额外调度从 1.4ms 增至 2.1/2.8ms，不启用切块。
 37. **用显存换速度的边界**：`gpuops.bilateral_blur` 仅对较小的 CUDA 张量使用 `F.unfold` 全邻域向量化，计算前按展开张量估算显存；超过 256MB 或 CPU 路径保留逐位叠加。与参考最大误差 <1e-5 的回归测试见 `tests/test_gpuops_bilateral.py`。在 540p 预览口径，默认美颜样图整链约 21→14.5ms/帧。
+38. **全开模式的 WDDM 长尾**：本机人脸+手+RVM+深度并发时，模型本身稳态约 20ms，但独立 CUDA stream 偶发 1.5~5s 停顿。GUI worker 对三路及以上推理需求改为同一 stream 串行提交；完整 Retinexformer+换脸预览样图 540p 在预热后约 104ms/帧、30 帧无秒级尖峰。Depth Anything 的 CUDA Graph 必须在提交并发任务前捕获，否则可能污染 CUDA 上下文。手部跟踪结果必须按 `MAX_HANDS` 封顶并拒绝非有限/越界关键点，否则假轨迹增殖让每帧前向次数失控。此处长尾只在当前 RTX 3060 Laptop + WDDM 组合验证，其他硬件要重新测。
 
 ## Git 约定
 

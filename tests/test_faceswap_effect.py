@@ -51,14 +51,18 @@ class TestFaceSwapEffect(unittest.TestCase):
 
         out1 = effect.process(frame, ctx)
         out2 = effect.process(frame, ctx)
+        full = np.zeros((720, 1280, 3), np.uint8)
+        effect.process(full, ctx)
 
         self.assertEqual(int(out1.mean()), 1)
         self.assertEqual(int(out2.mean()), 1)
         load_image.assert_called_once_with("源脸.jpg")
         get_engine.return_value.process.assert_called_once()
-        delaunay.assert_called_once()
-        self.assertEqual(swap.call_count, 2)
+        self.assertEqual(delaunay.call_count, 2)
+        self.assertEqual(swap.call_count, 3)
         self.assertEqual(swap.call_args.kwargs["triangles"], [(0, 1, 2)])
+        self.assertEqual(swap.call_args_list[0].kwargs["triangles"],
+                         effect._preview_triangles)
 
     def test_no_target_face_keeps_frame(self):
         effect = FaceSwapEffect(enabled=True, params={

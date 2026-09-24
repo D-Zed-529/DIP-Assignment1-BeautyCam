@@ -14,11 +14,19 @@ import numpy as np
 
 from core.context import FrameContext
 from core.effects.segment import load_image
-from core.infer import get_engine
+from core.infer import FACE_OVAL_IDS, get_engine
 from core.pipeline import Effect, NEED_FACES
 from demos.faceswap.faceswap import delaunay_triangles, faceswap
 
 MAX_SOURCE_SIDE = 1200  # 超大照片先等比缩小，降低首次建网与逐帧仿射开销
+PREVIEW_MAX_SIDE = 960  # GUI 流畅预览上限；拍照原尺寸仍用完整三角网
+# 预览保留半数面片控制点及轮廓/五官锚点，减少每帧约 900 次小块仿射。
+PREVIEW_FEATURE_IDS = frozenset((
+    33, 133, 159, 145, 362, 263, 386, 374,  # 眼睛
+    1, 4, 6, 168, 197, 2, 98, 327,            # 鼻子
+    0, 13, 14, 17, 61, 78, 81, 87, 91, 95,
+    291, 308, 311, 317, 321, 324,             # 嘴唇
+))
 FACE_LIBRARY_DIR = Path(__file__).resolve().parents[2] / "assets" / "faces"
 FACE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -43,6 +51,7 @@ class FaceSwapEffect(Effect):
         self._source: np.ndarray | None = None
         self._source_lm: np.ndarray | None = None
         self._triangles: list[tuple[int, int, int]] | None = None
+        self._preview_triangles: list[tuple[int, int, int]] | None = None
         self._runtime_status = "请选择一张已获授权的源脸图片"
 
     @staticmethod
@@ -73,6 +82,7 @@ class FaceSwapEffect(Effect):
     def _load_source(self, path: str) -> bool:
         self._cached_path = path
         self._source = self._source_lm = self._triangles = None
+        self._preview_triangles = None
         image = load_image(path)
         if image is None:
             self._runtime_status = "源脸图片无法读取，请重新选择"
@@ -90,6 +100,12 @@ class FaceSwapEffect(Effect):
         if not triangles:
             self._runtime_status = "源脸三角网生成失败，请重新选择照片"
             return False
+        keep = sorted(set(range(0, len(pts), 2))
+                      | set(FACE_OVAL_IDS) | PREVIEW_FEATURE_IDS)
+        keep = [i for i in keep if i < len(pts)]
+        preview = delaunay_triangles(pts[keep], image.shape[:2])
+        self._preview_triangles = [tuple(keep[i] for i in tri)
+                                   for tri in preview] if preview else triangles
         self._source, self._source_lm, self._triangles = image, lm, triangles
         self._runtime_status = f"换脸生效中：{os.path.basename(path)}"
         return True
@@ -116,5 +132,8 @@ class FaceSwapEffect(Effect):
         return faceswap(
             self._source, self._source_lm, frame, ctx.faces[0].landmarks,
             color_transfer=bool(p["color_transfer"]),
-            triangles=self._triangles,
+            triangles=(self._preview_triangles
+                       if self._preview_triangles is not None
+                       and max(frame.shape[:2]) <= PREVIEW_MAX_SIDE
+                       else self._triangles),
         )

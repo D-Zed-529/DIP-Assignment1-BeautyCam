@@ -6,6 +6,8 @@ from unittest.mock import patch
 import numpy as np
 
 from core.effects.beauty import BeautyEffect
+from core.effects.bokeh import BokehEffect
+from core.effects.segment import SegmentEffect
 from core.context import FrameContext
 from core.gestures import AutoCaptureState
 from core.pipeline import Pipeline
@@ -49,6 +51,22 @@ class TestWorkerInferenceNeeds(unittest.TestCase):
         self.assertTrue(self.engine.kwargs["faces"])
         self.assertFalse(self.engine.kwargs["hands"])
         self.assertTrue(self.engine.kwargs["blendshapes"])
+
+    def test_full_load_uses_serial_cuda_and_restores_light_load(self):
+        self.engine.parallel_inference = True
+        pipe = Pipeline([BeautyEffect(), SegmentEffect(enabled=True),
+                         BokehEffect(enabled=True)])
+        worker = CameraWorker(object(), pipe, self.engine,
+                              triggers={TRIGGER_V_SIGN, TRIGGER_SMILE})
+        worker._infer(self.frame, 0)
+        self.assertFalse(self.engine.parallel_inference)
+        self.assertTrue(self.engine.kwargs["hands"])
+        self.assertTrue(self.engine.kwargs["depth"])
+        pipe.set_enabled("segment", False)
+        pipe.set_enabled("bokeh", False)
+        worker.triggers = set()
+        worker._infer(self.frame, 1)
+        self.assertTrue(self.engine.parallel_inference)
 
 
 class _OneFrameSource:

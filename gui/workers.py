@@ -43,6 +43,9 @@ PHOTOS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "photos")
 
 FPS_SMOOTHING = 0.9   # FPS 指数平滑系数
+# 本机 WDDM 下三路及以上 CUDA stream 偶发秒级停顿；重负载帧串行提交
+# 稳态多约 5~10ms，但端到端平均帧率与预览连续性更好。
+PARALLEL_INFERENCE_MAX_TASKS = 2
 
 # HDR 连拍读帧的失败重试（连拍期间偶发空帧，超过则放弃本组）
 HDR_MAX_EMPTY = 10
@@ -79,6 +82,8 @@ class CameraWorker(QThread):
         self.source = source
         self.pipeline = pipeline
         self.engine = engine
+        self._allow_parallel_inference = bool(
+            getattr(engine, "parallel_inference", False))
         self.display_size = display_size
         # 处理分辨率系数（流畅优先模式）：预览链在降采样帧上跑（像素域
         # 开销近似按平方缩减），拍照时用原始全分辨率帧一次性重处理，
@@ -290,6 +295,11 @@ class CameraWorker(QThread):
             needs.add(NEED_HANDS)
         if want_smile:
             needs.add(NEED_FACES)
+        if hasattr(self.engine, "parallel_inference"):
+            # 仅工作线程修改；源脸加载/拍照也在本线程中，避免并发切换。
+            self.engine.parallel_inference = (
+                self._allow_parallel_inference
+                and len(needs) <= PARALLEL_INFERENCE_MAX_TASKS)
         kwargs = {}
         if str(getattr(self.engine, "backend_name", "")).startswith("torch"):
             kwargs["blendshapes"] = want_smile   # torch 引擎独有参数

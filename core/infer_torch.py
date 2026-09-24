@@ -642,11 +642,13 @@ class TorchInferenceEngine:
     def _process_hands(self, rgb_t, frame_wh) -> list[HandInfo]:
         cands: list[dict] = []      # {"lm"(np), "handedness", "presence"}
         for tr in self._hand_tracks:
+            if not self._valid_hand_landmarks(tr["lm"]):
+                continue
             center, side, rot = _rect_from_landmarks(
                 tr["lm"], HAND_TRACK_SCALE, HAND_ROT_IDS, frame_wh)
             lm, presence, hd = self._hand_landmarks(rgb_t, center, side, rot,
                                                     frame_wh)
-            if lm is not None:
+            if lm is not None and self._valid_hand_landmarks(lm):
                 cands.append(dict(lm=lm, presence=presence, hd=hd))
         # palm 检测：无手轨迹时每帧跑，有手时隔帧刷新（192 输入的逐算子图较重）
         if (not cands or self._frame_id
@@ -665,7 +667,7 @@ class TorchInferenceEngine:
                 rot = math.atan2(ys[2] - ys[0], xs[2] - xs[0]) - math.pi / 2
                 lm, presence, hd = self._hand_landmarks(rgb_t, center, side,
                                                         rot, frame_wh)
-                if lm is not None:
+                if lm is not None and self._valid_hand_landmarks(lm):
                     cands.append(dict(lm=lm, presence=presence, hd=hd))
         # 与人脸同款自适应 presence 门限（绝对 0.5 或相对 0.4×pmax）
         pmax = max((c["presence"] for c in cands), default=0.0)
@@ -679,10 +681,25 @@ class TorchInferenceEngine:
             if any(_lm_iou(c["lm"], a["lm"]) > 0.3 for a in accepted):
                 continue
             accepted.append(c)
+            # 旧轨迹和本帧检测会同时进入候选池。去重失败时也必须遵守
+            # max_num_hands=2，否则轨迹逐帧膨胀，前向次数和延迟失控。
+            if len(accepted) >= MAX_HANDS:
+                break
         self._hand_tracks = [{"lm": c["lm"].copy(),
                               "handedness": c["hd"]} for c in accepted]
         return [HandInfo(landmarks=c["lm"], handedness=c["hd"])
                 for c in accepted]
+
+    @staticmethod
+    def _valid_hand_landmarks(lm: np.ndarray) -> bool:
+        """拒绝非有限或远离画面的假轨迹，避免下帧 ROI 变成巨大框。"""
+        xy = np.asarray(lm)[:, :2]
+        if not np.isfinite(xy).all():
+            return False
+        lo, hi = xy.min(axis=0), xy.max(axis=0)
+        span = hi - lo
+        return bool(np.all(span > 0.002) and np.all(span < 2.0)
+                    and np.all(hi > -0.25) and np.all(lo < 1.25))
 
     # ------- 分割 -------
 

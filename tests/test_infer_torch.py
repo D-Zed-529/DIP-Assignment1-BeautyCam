@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -73,6 +74,36 @@ class TestTorchEngine(unittest.TestCase):
         self.assertEqual(set(counts), {1},
                          f"人脸数应恒为 1，实际 {counts}")
 
+    def test_hand_tracks_stay_bounded_and_reject_invalid_points(self):
+        """手部假轨迹不得突破双手上限或把 NaN ROI 带入下一帧。"""
+        def hand(x):
+            lm = np.zeros((21, 3), np.float32)
+            lm[:, 0] = x + np.linspace(0, 0.04, 21)
+            lm[:, 1] = 0.4 + np.linspace(0, 0.05, 21)
+            return lm
+
+        saved = self.engine._hand_tracks
+        saved_frame_id = self.engine._frame_id
+        try:
+            points = [hand(x) for x in (0.1, 0.35, 0.6, 0.85)]
+            self.engine._hand_tracks = [dict(lm=lm, handedness="Right")
+                                        for lm in points]
+            stale = hand(0.4)
+            stale[0, 0] = np.nan
+            self.engine._hand_tracks.append(
+                dict(lm=stale, handedness="Right"))
+            self.engine._frame_id = 1
+            with patch.object(self.engine, "_hand_landmarks",
+                              side_effect=[(lm, 0.95, "Right")
+                                           for lm in points]):
+                hands = self.engine._process_hands(None, (960, 540))
+            self.assertEqual(len(hands), 2)
+            self.assertEqual(len(self.engine._hand_tracks), 2)
+            self.assertFalse(self.engine._valid_hand_landmarks(stale))
+        finally:
+            self.engine._hand_tracks = saved
+            self.engine._frame_id = saved_frame_id
+
     def test_no_false_face_on_background(self):
         """纯背景帧不得检出人脸（presence = sigmoid(Identity_1) 过滤幻影）。"""
         bg = np.zeros((720, 1280, 3), np.uint8)
@@ -115,6 +146,28 @@ class TestTorchEngine(unittest.TestCase):
         finally:
             self.engine.parallel_inference = original
             self.engine.reset_temporal()
+
+    def test_first_depth_capture_with_parallel_models(self):
+        """深度 Graph 首次捕获不能与人脸/手部 stream 抢占上下文。"""
+        from core.infer_torch import TorchInferenceEngine
+
+        engine = TorchInferenceEngine(parallel_inference=True)
+        try:
+            try:
+                ctx = engine.process(self.img, faces=True, hands=True,
+                                     segmentation=True, depth=True,
+                                     blendshapes=False)
+            except FileNotFoundError:
+                self.skipTest("Depth Anything V2 权重缺失")
+            self.assertIsNotNone(ctx.depth)
+            self.assertIsNotNone(ctx.person_alpha)
+            # 捕获成功后再回放一次，检查 CUDA 上下文仍可继续工作。
+            next_ctx = engine.process(self.img, faces=True, hands=True,
+                                      segmentation=True, depth=True,
+                                      blendshapes=False)
+            self.assertIsNotNone(next_ctx.depth)
+        finally:
+            engine.close()
 
 
 @unittest.skipUnless(RVM_READY and _SAMPLE.exists(), "RVM 权重缺失")
