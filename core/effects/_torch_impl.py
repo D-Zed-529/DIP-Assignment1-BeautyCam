@@ -149,8 +149,8 @@ def beauty_slim_eyes(f_bgr: torch.Tensor, faces: list, params: dict,
     return f
 
 
-def _enlarge_eyes(f: torch.Tensor, landmarks: np.ndarray,
-                  strength: float, w: int, h: int) -> torch.Tensor:
+def _enlarge_eyes_t(f: torch.Tensor, landmarks: np.ndarray,
+                    strength: float, w: int, h: int) -> torch.Tensor:
     """大眼（CPU enlarge_eyes 的 GPU 对应：局部 remap + 羽化混合，float 域）。"""
     from .beauty import EYE_MIN_CORNER_RATIO, EYE_RADIUS_FROM_CORNERS, \
         EYE_RADIUS_RATIO, LEFT_EYE_IDS, RIGHT_EYE_IDS
@@ -178,8 +178,10 @@ def _enlarge_eyes(f: torch.Tensor, landmarks: np.ndarray,
         src_x = np.clip(cx + dx * scale, 0, w - 1).astype(np.float32)
         src_y = np.clip(cy + dy * scale, 0, h - 1).astype(np.float32)
         sub = out[:, :, y1:y2, x1:x2]
-        roi = gpu.remap(sub, torch.from_numpy(src_x).to(f.device),
-                        torch.from_numpy(src_y).to(f.device))
+        # remap 的输入是 ROI 子图，采样坐标必须减去 ROI 原点。
+        roi = gpu.remap(sub,
+                        torch.from_numpy(src_x - np.float32(x1)).to(f.device),
+                        torch.from_numpy(src_y - np.float32(y1)).to(f.device))
         weight = torch.from_numpy(
             np.clip(1.0 - dist / r, 0.0, 1.0)[None, None].astype(np.float32)
         ).to(f.device)
@@ -307,6 +309,8 @@ def segment_process_t(f_u8: torch.Tensor, effect, ctx) -> torch.Tensor:
     CPU 侧 _prev_alpha 与之独立，切后端时自动断开）。
     alpha 取 ctx.person_alpha_t（引擎直供张量，无 numpy 中转）。
     """
+    from .segment import MODE_BLUR
+
     p = effect._p()
     h, w = f_u8.shape[-2:]
 
@@ -328,8 +332,9 @@ def segment_process_t(f_u8: torch.Tensor, effect, ctx) -> torch.Tensor:
     alpha = effect._prev_alpha_t
     if alpha is None:
         return f_u8                # 还没有任何掩膜：透传（CPU 版同语义）
-    if float(alpha.mean()) < float(p["min_person_ratio"]):
-        return f_u8                # 人像占比过低：透传
+    if p["mode"] == MODE_BLUR and \
+            float(alpha.mean()) < float(p["min_person_ratio"]):
+        return f_u8                # 虚化模式的低占比保护
 
     if int(p["edge_shift"]):
         alpha = gpu.morph_op((alpha * 255).to(torch.uint8),

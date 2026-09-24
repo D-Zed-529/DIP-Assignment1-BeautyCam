@@ -79,7 +79,7 @@
 
 ## 验证方式
 
-- 单测：`python -m unittest discover tests`（230 个用例；不依赖摄像头与 GUI；CUDA / 各权重缺失的用例自动跳过；torch 引擎的跟踪稳定性、幻影拒检、RVM 探针语义、并发一致性、GPU 融合链与 ctx 双形态均有专测）。
+- 单测：`python -m unittest discover tests`（236 个用例；不依赖摄像头与 GUI；CUDA / 各权重缺失的用例自动跳过；torch 引擎的跟踪稳定性、幻影拒检、RVM 探针语义、并发一致性、GPU 融合链与 ctx 双形态均有专测）。
 - 数值校准：`python scripts/calibrate_torch.py`（torch vs mediapipe：landmark Δ、alpha MAE、blendshapes 对照；定版记录在 `core/infer_torch.py` 模块头。注意 face_lm 输出在 256 像素域、blendshapes 输入是像素坐标——脚本已按此口径比较）。
 - 性能基准：`python scripts/bench.py --markdown-out outputs/bench.md`（GPU 时钟拉频口径）；逐阶段分解用 `python scripts/profile_stages.py`（推理/效果/组合分层计时，冷态数字无效、看预热后稳态）。
 - 低光客观评测：`python scripts/eval_lowlight.py --save-compare`。

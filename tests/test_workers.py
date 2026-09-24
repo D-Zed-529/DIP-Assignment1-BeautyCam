@@ -1,10 +1,13 @@
 """相机线程的按需推理调度测试（不打开摄像头）。"""
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from core.effects.beauty import BeautyEffect
+from core.context import FrameContext
+from core.gestures import AutoCaptureState
 from core.pipeline import Pipeline
 from gui.workers import CameraWorker, TRIGGER_SMILE, TRIGGER_V_SIGN
 
@@ -46,6 +49,51 @@ class TestWorkerInferenceNeeds(unittest.TestCase):
         self.assertTrue(self.engine.kwargs["faces"])
         self.assertFalse(self.engine.kwargs["hands"])
         self.assertTrue(self.engine.kwargs["blendshapes"])
+
+
+class _OneFrameSource:
+    continuous = False
+
+    def __init__(self):
+        self.frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+    def read(self):
+        if self.frame is None:
+            return False, None
+        frame, self.frame = self.frame, None
+        return True, frame
+
+
+class _ContextEngine(_RecordingEngine):
+    def process(self, frame, **kwargs):
+        self.kwargs = kwargs
+        return FrameContext(width=frame.shape[1], height=frame.shape[0])
+
+
+class TestWorkerAutoCapture(unittest.TestCase):
+    def _run_trigger(self, trigger, detector_name):
+        engine = _ContextEngine()
+        worker = CameraWorker(_OneFrameSource(), Pipeline([]), engine,
+                              triggers=set(), process_scale=1.0)
+        # 模拟相机启动后用户才勾选触发器。
+        worker.triggers = {trigger}
+        worker._auto_state = AutoCaptureState(v_hold=0, smile_hold=0,
+                                               cooldown=0)
+        saved = []
+        worker._save_photo = lambda frame, name: saved.append(name)
+        with patch(f"gui.workers.{detector_name}", return_value=True):
+            worker._loop()
+        self.assertEqual(saved, [trigger])
+        return engine.kwargs
+
+    def test_v_sign_after_start_captures(self):
+        kwargs = self._run_trigger(TRIGGER_V_SIGN, "is_v_sign")
+        self.assertTrue(kwargs["hands"])
+
+    def test_smile_after_start_captures(self):
+        kwargs = self._run_trigger(TRIGGER_SMILE, "any_smiling")
+        self.assertTrue(kwargs["faces"])
+        self.assertTrue(kwargs["blendshapes"])
 
 
 if __name__ == "__main__":

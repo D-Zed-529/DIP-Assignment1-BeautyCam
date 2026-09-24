@@ -237,6 +237,11 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.hdr_panel)
         self.capture_panel = CapturePanel(self._manual_capture)
         lay.addWidget(self.capture_panel)
+        # 运行中切换自动拍照和预览分辨率，下一帧立即同步到 worker。
+        for checkbox in (self.capture_panel.chk_vsign,
+                         self.capture_panel.chk_smile,
+                         self.capture_panel.chk_smooth):
+            checkbox.toggled.connect(self._sync_capture_options)
 
         lay.addStretch(1)
         scroll = QScrollArea()
@@ -405,16 +410,19 @@ class MainWindow(QMainWindow):
     def _manual_capture(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_capture()
-        # 触发器复选框变化同步给 worker（collection 赋值原子，无需锁）
+
+    def _sync_capture_options(self, *_: object) -> None:
+        """GUI 复选框变化立即更新工作线程的触发器和预览分辨率。"""
         if self.worker is not None:
             self.worker.triggers = self.capture_panel.triggers()
+            self.worker.process_scale = (
+                0.75 if self.capture_panel.smooth_mode() else 1.0)
 
     def _hdr_capture(self, ev_preset: str, tonemap: object) -> None:
         """HDR 连拍入口（HdrPanel 回调；tonemap None=直出 Mertens）。"""
         if self.worker is None or not self.worker.isRunning():
             self.statusBar().showMessage("先「开始」相机再连拍 HDR")
             return
-        self.worker.triggers = self.capture_panel.triggers()
         self.worker.request_hdr_capture(ev_preset, tonemap)
 
     def _on_model_change(self, key: str) -> None:

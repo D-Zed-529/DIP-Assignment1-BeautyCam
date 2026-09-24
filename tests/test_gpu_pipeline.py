@@ -61,6 +61,18 @@ class TestGpuCpuBoundary(unittest.TestCase):
         out = pipeline.process(frame, FrameContext(width=5, height=4))
         self.assertTrue(np.all(out == 35))
 
+    def test_color_background_with_empty_matte(self):
+        """CUDA 效果链的纯色替换不依赖最低人像面积。"""
+        from core.context import FrameContext
+        from core.effects.segment import MODE_COLOR, SegmentEffect
+        frame = np.full((12, 16, 3), 200, np.uint8)
+        ctx = FrameContext(width=16, height=12,
+                           person_alpha=np.zeros((12, 16), np.float32))
+        effect = SegmentEffect(params={"mode": MODE_COLOR, "bg_color": "#00B140",
+                                       "refine": False, "feather": 0.0})
+        out = Pipeline([effect], use_gpu=True).process(frame, ctx)
+        self.assertTrue(np.all(out == np.array([64, 177, 0], np.uint8)))
+
 
 def _sample_720p():
     img = cv2.imread(str(_SAMPLE))
@@ -174,6 +186,23 @@ class TestGpuFusedPipeline(unittest.TestCase):
         self.segment.reset_temporal()
         self.assertIsNone(self.segment._prev_alpha_t)
         self.assertEqual(self.segment._bg_gpu_cache, {})
+
+    def test_gpu_enlarge_eyes_matches_cpu(self):
+        """大眼启用后 CUDA 路径应执行局部 remap，与 CPU 参考接近。"""
+        from core.effects.beauty import BeautyEffect
+        ctx = self.engine.process(self.img, faces=True, hands=False,
+                                  segmentation=False, blendshapes=False)
+        if not ctx.faces:
+            self.skipTest("样例图未检测到人脸")
+        effect = BeautyEffect(params={"smooth": 0.0, "whiten": 0.0,
+                                      "slim": 0.0, "eye_enabled": True,
+                                      "eye_strength": 0.5, "finish": False})
+        gpu_out = Pipeline([effect], use_gpu=True).process(self.img.copy(), ctx)
+        cpu_out = effect.process(self.img.copy(), ctx)
+        self.assertGreater(np.count_nonzero(np.abs(gpu_out.astype(int)
+                                                   - self.img.astype(int)) > 5), 100)
+        self.assertLess(np.abs(gpu_out.astype(int) - cpu_out.astype(int)).mean(),
+                        0.1)
 
 
 if __name__ == "__main__":

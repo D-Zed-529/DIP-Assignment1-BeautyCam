@@ -58,7 +58,7 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 │   ├── run_pipeline.py     #   headless 批跑 CLI
 │   ├── bench.py            #   性能基准（GPU 时钟拉频口径）
 │   └── eval_lowlight.py    #   低光 PSNR/SSIM 客观评测
-├── tests/                  # 230 个单测（不依赖摄像头/GUI；缺权重自动跳过）
+├── tests/                  # 236 个单测（不依赖摄像头/GUI；缺权重自动跳过）
 ├── models/torch/           # TorchScript 权重（gitignore，convert_models.py 产出）
 ├── models/hf/              # Depth Anything V2（transformers 格式，gitignore）
 └── legacy/                 # 一期 Tkinter 单文件版（归档参考）
@@ -87,7 +87,7 @@ python scripts/calibrate_torch.py
 # 5) 启动 GUI（需摄像头 + 本地显示）
 python -m gui.main_window
 
-# 单测（230 个；CUDA/权重缺失的项自动跳过）
+# 单测（236 个；CUDA/权重缺失的项自动跳过）
 python -m unittest discover tests
 ```
 
@@ -162,7 +162,8 @@ python -m demos.faceswap.faceswap --src 源脸.jpg --dst 目标.jpg --out output
 ## 版本历史
 
 - **v3（2026-09-23）**：Windows + CUDA 迁移；推理全 GPU（TorchScript）；RVM 分割、Retinexformer 低光、Depth Anything V2 深度虚化三项模型升级/新增；同帧独立模型 CUDA stream 并发；220 单测。
-- **v3 合并（2026-09-24）**：接入队友的 Windows 摄像头回退、实时换脸与原创脸库；保留 CUDA 效果链并修复 GPU→CPU 插件交接；当前 230 单测。
+- **v3 合并（2026-09-24）**：接入队友的 Windows 摄像头回退、实时换脸与原创脸库；保留 CUDA 效果链并修复 GPU→CPU 插件交接；合并时 230 单测。
+- **v3 修复（2026-09-24）**：自动拍照复选框运行中即时生效；修复 CUDA 大眼函数调用及局部坐标；无人像时纯色/图片背景仍执行替换；236 单测。
 - **v2（2026-09）**：core/gui 分层 + PySide6 + 效果链插件；HDR / SCI 低光 / 虚拟背景 / 换脸 / 自适应画质；183 单测（macOS arm64 口径，详见 git 历史）。
 - **v1**：Tkinter 单文件版（`legacy/`）。
 

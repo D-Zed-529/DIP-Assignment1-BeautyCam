@@ -270,7 +270,7 @@ class SegmentEffect(Effect):
             "smooth": 0.7,            # 时域平滑系数 0~1
             "edge_shift": 0,          # 掩膜收缩(+)/膨胀(-) px，用于吃背景镶边
             "infer_interval": 1,      # 分割推理间隔帧数（选多分类模型时置 4）
-            "min_person_ratio": 0.02,  # 人像占比低于此值则原样输出，防"人消失"
+            "min_person_ratio": 0.02,  # 仅虚化模式的低占比保护；替换模式仍应显示背景
         }
 
     def __init__(self, *args, **kwargs):
@@ -346,8 +346,9 @@ class SegmentEffect(Effect):
         if alpha is None:
             return frame          # 还没有任何掩膜（未启用分割 / 模型未就绪）
 
-        # 人离开画面时整帧都会变成背景（"人消失了"）——占比过低就原样输出
-        if float(alpha.mean()) < float(p["min_person_ratio"]):
+        # 虚化时保留低占比保护；纯色/图片替换即使无人也应显示所选背景。
+        if p["mode"] == MODE_BLUR and \
+                float(alpha.mean()) < float(p["min_person_ratio"]):
             return frame
 
         if p["edge_shift"]:

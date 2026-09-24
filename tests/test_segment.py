@@ -290,10 +290,25 @@ class TestSegmentEffect(unittest.TestCase):
         self.assertFalse(np.array_equal(out, self.frame))
 
     def test_min_person_ratio_guard(self):
-        """人离开画面（掩膜全 0）时原样输出，避免"整个人消失"。"""
+        """虚化模式下掩膜全 0 时原样输出。"""
         ctx = ctx_with_alpha(np.zeros((60, 80), np.float32))
         out = self.eff.process(self.frame.copy(), ctx)
         self.assertTrue(np.array_equal(out, self.frame))
+
+    def test_color_mode_replaces_empty_mask(self):
+        """无人像时仍应显示纯色背景，不能被虚化模式的保护分支拦截。"""
+        self.eff.set_params(mode=MODE_COLOR, bg_color="#00B140")
+        ctx = ctx_with_alpha(np.zeros((60, 80), np.float32))
+        out = self.eff.process(self.frame.copy(), ctx)
+        self.assertTrue(np.all(out == np.array([64, 177, 0], np.uint8)))
+
+    def test_image_mode_replaces_empty_mask(self):
+        """无人像时也应显示选定的背景图片。"""
+        self.eff.set_params(mode=MODE_IMAGE, bg_path="fixture")
+        self.eff._load_image = lambda path, w, h: np.full((h, w, 3), 17, np.uint8)
+        ctx = ctx_with_alpha(np.zeros((60, 80), np.float32))
+        out = self.eff.process(self.frame.copy(), ctx)
+        self.assertTrue(np.all(out == 17))
 
     def test_disabled_effect_is_passthrough(self):
         self.eff.set_enabled(False)
