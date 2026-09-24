@@ -117,7 +117,8 @@ class BeautyPanel(QGroupBox):
         self.chk_face_only = QCheckBox("美白仅限脸部")
         self.chk_face_only.setChecked(p["whiten_scope"] == "face")
         self.chk_face_only.setToolTip(
-            "默认全身肤色美白（含脖子/手臂等皮肤）；勾选后仅脸部（一期口径）")
+            "默认美白脸+脖子+肩部（肤色检测已约束在人像区域，排除背景同色）；"
+            "勾选后仅脸部（一期口径）")
         self.chk_face_only.toggled.connect(
             lambda on: self.pipeline.set_params(
                 "beauty", whiten_scope="face" if on else "skin"))
@@ -172,7 +173,7 @@ class AutoEnhancePanel(QGroupBox):
         self.row_face = SliderRow(
             "人脸曝光优先", 0.0, 1.0, p["face_exposure"],
             self._set("face_exposure"))
-        self.row_face.setToolTip("人脸目标亮度从 115 插值到 150；0 = 全图统一曝光校正")
+        self.row_face.setToolTip("人脸目标亮度从 115 插值到 135；0 = 全图统一曝光校正")
         lay.addWidget(self.row_face)
         self.row_contrast = SliderRow(
             "对比度 (CLAHE)", 0.0, 1.0, p["contrast"], self._set("contrast"))
