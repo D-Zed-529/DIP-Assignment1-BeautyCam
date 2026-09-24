@@ -102,7 +102,8 @@ class MainWindow(QMainWindow):
 
         # 管线：自适应画质（链首，先校正曝光/色调，低光的暗光判定看到的是
         # 校正后的亮度）→ 低光（启发式/SCI/Retinexformer 互斥，默认都关）
-        # → 美颜 → 换脸 → 虚化/替换 → 深度渐进虚化（高级档，默认关）。
+        # → 美颜 → 虚化/替换 → 深度渐进虚化 → 换脸（CPU 收尾）。
+        # 换脸放在连续 GPU 效果之后，避免背景效果开启时多一次帧回传和上传。
         # 顺序对齐 PLAN §3.2；HDR 是拍照模式不进链（gui/workers.py 连拍）。
         self.pipeline = Pipeline([
             AutoEnhanceEffect(enabled=False, params={
@@ -115,9 +116,9 @@ class MainWindow(QMainWindow):
                 "smooth": 0.25, "whiten": 8.0, "slim": 0.20,
                 "finish": False,
             }),
-            FaceSwapEffect(enabled=False),
             SegmentEffect(enabled=False),
             BokehEffect(enabled=False),
+            FaceSwapEffect(enabled=False),
         ], use_gpu=_gpu_pipeline_ready())
         self.engine = get_engine()
         self.worker: Optional[CameraWorker] = None
