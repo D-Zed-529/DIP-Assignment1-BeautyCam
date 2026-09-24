@@ -332,6 +332,10 @@ class SegmentPanel(QGroupBox):
         lay.addWidget(self.lst_bg)
         self._load_gallery()
 
+        self.lbl_bg_status = QLabel("尚未选择背景图片")
+        self.lbl_bg_status.setWordWrap(True)
+        lay.addWidget(self.lbl_bg_status)
+
         btn_choose = QPushButton("选择图片…")
         btn_choose.clicked.connect(self._pick_file_bg)
         lay.addWidget(btn_choose)
@@ -392,15 +396,27 @@ class SegmentPanel(QGroupBox):
             self.pipeline.set_params("segment", **kwargs)
         return apply
 
-    def _mode_changed(self, *_) -> None:
-        """模式切换：同步参数并只显示该模式相关的控件。"""
+    def _mode_changed(self, index: int | None = None) -> None:
+        """切换模式时立即生效；首次选图片模式自动使用内置背景。"""
         mode = self.cmb_mode.currentData()
-        for w in (self.lbl_gallery, self.lst_bg):
+        for w in (self.lbl_gallery, self.lst_bg, self.lbl_bg_status):
             w.setVisible(mode == MODE_IMAGE)
         for w in (self.lbl_color, self.cmb_color):
             w.setVisible(mode == MODE_COLOR)
         self.row_strength.setVisible(mode == MODE_BLUR)
         self._set(mode=mode)()
+        if mode == MODE_IMAGE:
+            path = self.pipeline.get_effect("segment").get_params()["bg_path"]
+            if not path or load_image(path) is None:
+                paths = list_backgrounds()
+                path = paths[0] if paths else ""
+                self._set(bg_path=path)()
+            self.lbl_bg_status.setText(
+                f"当前背景：{os.path.basename(path)}" if path else
+                "没有可用背景图，请点击「选择图片…」")
+        # 构造函数末尾也会调用一次以初始化可见性；那次不改变总开关。
+        if index is not None:
+            self.chk_enabled.setChecked(True)
 
     def _load_gallery(self) -> None:
         """把内置图库填进列表（缩略图）。列表为空时给一行提示。"""
@@ -429,14 +445,22 @@ class SegmentPanel(QGroupBox):
     def _pick_gallery_bg(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)
         if path:
-            self._set(bg_path=path)()
+            self._set(mode=MODE_IMAGE, bg_path=path)()
+            self.cmb_mode.setCurrentIndex(self.cmb_mode.findData(MODE_IMAGE))
+            self.lbl_bg_status.setText(f"当前背景：{os.path.basename(path)}")
+            self.chk_enabled.setChecked(True)
 
     def _pick_file_bg(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "选择背景图片", "", "图片 (*.jpg *.jpeg *.png *.bmp *.webp)")
         if path:
+            if load_image(path) is None:
+                self.lbl_bg_status.setText("图片无法读取，请重新选择")
+                return
             self._set(mode=MODE_IMAGE, bg_path=path)()
             self.cmb_mode.setCurrentIndex(self.cmb_mode.findData(MODE_IMAGE))
+            self.lbl_bg_status.setText(f"当前背景：{os.path.basename(path)}")
+            self.chk_enabled.setChecked(True)
 
     def _model_changed(self, *_) -> None:
         key = self.cmb_model.currentData()

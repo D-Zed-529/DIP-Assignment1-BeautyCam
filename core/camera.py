@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import os
+import platform
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -95,15 +96,29 @@ class LiveCamera(CameraSource):
         self.last_error: str = ""
 
     def open(self) -> bool:
+        system = platform.system()
+        if system == "Darwin":
+            backends = [("AVFoundation", cv2.CAP_AVFOUNDATION)]
+        elif system == "Windows":
+            # 华为等 Windows 笔记本优先使用 DirectShow，驱动不支持时自动回退。
+            backends = [("DirectShow", cv2.CAP_DSHOW), ("自动", cv2.CAP_ANY)]
+        else:
+            backends = [("自动", cv2.CAP_ANY)]
         for attempt in range(self.OPEN_RETRIES):
-            # AVFoundation 后端显式指定，避免 OpenCV 误选其他后端
-            cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
-            if not cap.isOpened():
-                cap.release()
+            cap = None
+            for _, backend in backends:
+                candidate = cv2.VideoCapture(self.index, backend)
+                if candidate.isOpened():
+                    cap = candidate
+                    break
+                candidate.release()
+            if cap is None:
+                hint = ("请在系统设置 → 隐私与安全性 → 摄像头中授权当前应用。"
+                        if system == "Darwin" else
+                        "请检查系统摄像头权限，并确认摄像头未被其他应用占用。")
                 self.last_error = (
                     f"摄像头#{self.index} 打不开（第 {attempt + 1} 次）。"
-                    "最常见原因是 macOS 未授权：系统设置 → 隐私与安全性 → 摄像头，"
-                    "勾选运行 Python 的终端应用（Terminal/iTerm/VS Code 等）后重试。")
+                    f"已尝试：{'、'.join(name for name, _ in backends)}。{hint}")
                 time.sleep(self.OPEN_RETRY_DELAY)
                 continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)

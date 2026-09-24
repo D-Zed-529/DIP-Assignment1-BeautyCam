@@ -319,7 +319,12 @@ class MainWindow(QMainWindow):
 
     def _open_album(self) -> None:
         os.makedirs(PHOTOS_DIR, exist_ok=True)
-        subprocess.Popen(["open", PHOTOS_DIR])
+        if sys.platform == "win32":
+            os.startfile(PHOTOS_DIR)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", PHOTOS_DIR])
+        else:
+            subprocess.Popen(["xdg-open", PHOTOS_DIR])
 
     # ---------------- 其他 ----------------
 

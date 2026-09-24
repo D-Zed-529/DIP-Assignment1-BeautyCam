@@ -59,6 +59,24 @@
 
 ## 环境与运行
 
+Windows（含华为笔记本，建议 Python 3.11/3.12）：在 PyCharm 打开仓库根目录，
+将解释器设为本项目的 `.venv\Scripts\python.exe`，运行模块
+`gui.main_window`。首次使用先安装 `requirements.txt` 并运行
+`python scripts/download_models.py`。摄像头保持 `0`，点击「开始」；
+程序会优先尝试 DirectShow，失败时回退 OpenCV 自动后端。
+在「人像虚化 / 背景替换」中选「背景虚化」即启用虚化；选「换成背景图」
+会自动启用效果并选中第一张内置背景，也可点击图库缩略图或「选择图片…」。
+选择图片后面板会显示当前文件名；若图片无法读取会提示重新选择。
+
+PowerShell 首次安装示例：
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe scripts/download_models.py
+.\.venv\Scripts\python.exe -m gui.main_window
+```
+
 macOS（arm64）+ Python 3.12：
 
 ```bash
