@@ -16,7 +16,7 @@
 | 低光增强（Phase 2） | 双引擎可切：**SCI 深度模型**（CVPR 2022，ONNX 54KB、固定 512×512 推理 + 上采样、easy/medium/difficult 三档、隔帧复用降载、亮度自动触发；CoreML EP 实测 1.7ms/次 vs CPU 7.4ms，**4.3 倍**，合成暗图 PSNR 22.1dB 启发式 14.4dB）与一期启发式基线（线性增益+直方图均衡）共存，构成"经典 vs 深度"对比线 |
 | **自适应画质优化** | `core/effects/autoenhance.py`：全时段经典 DIP 画面校正（与低光增强互补——本效果管逆光脸黑/轻度过曝/偏色/发灰等常态问题）。**FaceMesh 轮廓分区统计**直方图 → 人脸/背景各自 gamma 自动曝光（目标 150/115，容差带防抖，幂变换 LUT 按软掩膜混合）→ CLAHE 对比度 → **灰世界白平衡**（背景区估计，避开肤色污染）→ LAB 饱和度；统计量参数级 EMA 时域平滑防闪。人脸区域复用美颜的 FaceMesh 推理，零额外模型；实测效果本体 14.6ms/帧 |
 | **自动 HDR 拍照（Phase 1）** | `core/effects/hdr.py`：连拍（0.12s 间隔采集自然抖动）→ gamma LUT 模拟包围曝光（macOS 不支持手动曝光的关键绕坑决策）→ findTransformECC 帧间对齐 → MergeMertens 融合 → 可选 Drago/Reinhard 色调映射；成片/各 EV 原图/对照图一并存档 |
-| **换脸（演示级，Phase 4）** | `demos/faceswap/`：FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → seamlessClone 泊松融合 → Reinhard 色彩迁移；**每阶段中间产物存图**（课堂讲解素材）；CLI `--consent` 强制伦理确认（仅本人/授权/动漫形象） |
+| **换脸（演示级，Phase 4）** | 离线演示与相机窗口实时预览均已接入：FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → seamlessClone 泊松融合 → Reinhard 色彩迁移；离线版保存各阶段中间产物，实时版复用相机关键点并缓存源脸三角网；GUI 内置 4 张原创虚构头像且支持自行上传，CLI/GUI 均设授权确认门（仅本人/已授权者/动漫形象） |
 | 手势拍照 | 剪刀手判定不变（食指+中指伸直、夹角 15°–65°），**改用墙钟时间持续 1s 判定**（一期帧计数在帧率波动时不稳） |
 | 笑脸拍照 | FaceBlendshapes `mouthSmile` 置信度 > 0.45 持续 0.5s（比一期嘴部张合更抗头姿干扰），缺失时自动回退一期口径 |
 | GUI | PySide6 暗色主题：视频区 + 效果面板（开关/滑杆）+ 采集源选择（摄像头/视频文件）+ 拍照预览条（点击放大）+ 状态栏 FPS |
@@ -38,10 +38,10 @@
 │   └── effects/           #   beauty.py / lowlight.py（启发式+SCI）/ segment.py / hdr.py
 ├── gui/                   # PySide6 界面
 │   ├── main_window.py     #   主窗口（python -m gui.main_window）
-│   ├── panels.py          #   效果控制面板（美颜/低光/虚化/HDR/拍照）
+│   ├── panels.py          #   效果控制面板（美颜/低光/虚化/实时换脸/HDR/拍照）
 │   ├── workers.py         #   QThread 相机工作线程（信号发帧 + HDR 连拍）
 │   └── theme.qss          #   暗色主题（卡片化 + 徽章体系）
-├── demos/faceswap/        # 换脸演示（Delaunay+泊松，过程可视化，--consent 伦理门）
+├── demos/faceswap/        # 离线/实时换脸（Delaunay+泊松、过程可视化、授权门）
 ├── scripts/
 │   ├── download_models.py #   拉取 MediaPipe + SCI 模型到 models/
 │   ├── make_backgrounds.py#   程序化生成虚拟背景图库（无版权风险）
@@ -51,6 +51,7 @@
 ├── tests/                 # 纯函数单测（不依赖摄像头/GUI）
 ├── assets/samples/        # 测试样例图
 ├── assets/backgrounds/    # 虚拟背景图库（10 张，程序化生成）
+├── assets/faces/          # 实时换脸内置图库（4 张原创虚构头像）
 ├── legacy/                # 一期 Tkinter 单文件版（归档参考）
 ├── docs/                  # PLAN.md / research-notes.md
 ├── TODO.md                # 分阶段任务清单
@@ -185,7 +186,7 @@ v2 定位为**多效果实时相机系统**，详见 [docs/PLAN.md](docs/PLAN.md
 - ~~**自动 HDR 拍照**（P1）~~：**已完成**（gamma 模拟包围曝光 + ECC 对齐 + Mertens + tonemap + 连拍存档）
 - ~~**低光增强**（P2）~~：**已完成**（SCI ONNX 定版，CoreML EP，双引擎可切）
 - ~~**人像虚化 / 背景替换**（P3）~~：**已完成**（三档模式 + 边缘精修 + 程序化背景图库）；进阶档深度渐进虚化（P3-4，Depth Anything V2）未做
-- ~~**换脸（演示级）**（P4）~~：**已完成**（Delaunay + 泊松融合 + 过程可视化 + `--consent` 伦理门）；P4-3 实时版为可选项未做
+- ~~**换脸（演示级）**（P4）~~：**已完成**（离线过程可视化 + 相机窗口实时预览 + Delaunay/泊松融合 + Reinhard 肤色匹配 + 4 张原创内置脸库 + 自行上传 + CLI/GUI 授权确认门）
 - **GPU 加速与评测**（P5）：CoreML EP 已启用并验证（SCI 4.3 倍）、性能基准脚本（`bench.py`）与低光客观评测（`eval_lowlight.py`）就绪；主观问卷与 PPT 由小组线下完成
 
 > 硬件部分（STM32F103 + LED 指示灯联动）的代码不在本仓库，PPT 中的相关内容为另一条交付线。
