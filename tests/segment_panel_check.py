@@ -12,7 +12,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from core.effects.segment import MODE_BLUR, MODE_IMAGE, SegmentEffect, load_image  # noqa: E402
 from core.pipeline import Pipeline  # noqa: E402
-from gui.panels import SegmentPanel  # noqa: E402
+from demos.faceswap.effect import FaceSwapEffect  # noqa: E402
+from gui.panels import FaceSwapPanel, SegmentPanel  # noqa: E402
 
 
 class TestSegmentPanel(unittest.TestCase):
@@ -48,6 +49,30 @@ class TestSegmentPanel(unittest.TestCase):
         self.assertTrue(self.effect.enabled)
         self.assertEqual(self.effect.get_params()["bg_path"],
                          item.data(Qt.ItemDataRole.UserRole))
+
+
+class TestFaceSwapPanel(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.effect = FaceSwapEffect(enabled=False)
+        self.panel = FaceSwapPanel(Pipeline([self.effect]))
+
+    def tearDown(self):
+        self.panel.close()
+
+    def test_enable_requires_consent_and_source(self):
+        self.assertGreaterEqual(self.panel.lst_faces.count(), 4)
+        self.assertFalse(self.panel.chk_enabled.isEnabled())
+        self.panel.chk_consent.setChecked(True)
+        self.assertFalse(self.panel.chk_enabled.isEnabled())
+        self.panel._pick_gallery_source(self.panel.lst_faces.item(0))
+        self.assertTrue(self.panel.chk_enabled.isEnabled())
+        self.assertTrue(self.effect.enabled)
+        self.panel.chk_consent.setChecked(False)
+        self.assertFalse(self.effect.enabled)
 
 
 if __name__ == "__main__":

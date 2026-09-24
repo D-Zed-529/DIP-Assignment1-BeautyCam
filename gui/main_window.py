@@ -28,9 +28,10 @@ from core.effects.lowlight import LowLightDnnEffect, LowLightEffect
 from core.effects.segment import SegmentEffect
 from core.infer import SEGMENTER_INTERVAL, get_engine
 from core.pipeline import Pipeline
+from demos.faceswap.effect import FaceSwapEffect
 from gui.panels import (
-    AutoEnhancePanel, BeautyPanel, CapturePanel, HdrPanel, LowLightPanel,
-    SegmentPanel,
+    AutoEnhancePanel, BeautyPanel, CapturePanel, FaceSwapPanel, HdrPanel,
+    LowLightPanel, SegmentPanel,
 )
 from gui.workers import CameraWorker, DISPLAY_SIZE, PHOTOS_DIR
 
@@ -88,13 +89,14 @@ class MainWindow(QMainWindow):
         self.resize(1360, 800)
 
         # 管线：自适应画质（链首，先校正曝光/色调，低光的暗光判定看到的是
-        # 校正后的亮度）→ 低光（启发式/SCI 互斥，默认都关）→ 美颜 → 虚化/替换。
+        # 校正后的亮度）→ 低光（启发式/SCI 互斥）→ 美颜 → 换脸 → 虚化/替换。
         # 顺序对齐 PLAN §3.2；HDR 是拍照模式不进链（gui/workers.py 连拍）。
         self.pipeline = Pipeline([
             AutoEnhanceEffect(enabled=False),
             LowLightEffect(enabled=False),
             LowLightDnnEffect(enabled=False),
             BeautyEffect(enabled=True),
+            FaceSwapEffect(enabled=False),
             SegmentEffect(enabled=False),
         ])
         self.engine = get_engine()
@@ -119,7 +121,7 @@ class MainWindow(QMainWindow):
         hlay = QHBoxLayout(header)
         title = QLabel("BeautyCam v2")
         title.setObjectName("appTitle")
-        subtitle = QLabel("DIP 课程项目 · 美颜 / 虚化 / HDR / 低光增强")
+        subtitle = QLabel("DIP 课程项目 · 美颜 / 虚化 / 换脸 / HDR / 低光增强")
         subtitle.setObjectName("appSubtitle")
         hlay.addWidget(title)
         hlay.addWidget(subtitle)
@@ -199,6 +201,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lowlight_panel)
         self.segment_panel = SegmentPanel(self.pipeline, self._on_model_change)
         lay.addWidget(self.segment_panel)
+        self.faceswap_panel = FaceSwapPanel(self.pipeline)
+        lay.addWidget(self.faceswap_panel)
         self.hdr_panel = HdrPanel(self._hdr_capture)
         lay.addWidget(self.hdr_panel)
         self.capture_panel = CapturePanel(self._manual_capture)
@@ -258,6 +262,8 @@ class MainWindow(QMainWindow):
     def _on_frame(self, frame: np.ndarray) -> None:
         # worker 已按显示尺寸预缩放：主线程零缩放，只做 QImage 包装
         self.video_label.setPixmap(frame_to_pixmap(frame))
+        effect = self.pipeline.get_effect("faceswap")
+        self.faceswap_panel.update_runtime_status(effect.runtime_status)
 
     def _on_face_count(self, n: int) -> None:
         self._last_faces = n

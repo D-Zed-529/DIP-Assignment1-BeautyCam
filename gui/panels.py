@@ -23,6 +23,7 @@ from core.effects.segment import (
 )
 from core.infer import DEFAULT_SEGMENTER, SEGMENTER_SPECS
 from core.pipeline import Pipeline
+from demos.faceswap.effect import list_face_presets
 
 # 低光增强引擎选择（Phase 2：「经典 vs 深度」对比线）
 LOWLIGHT_CHOICES = [
@@ -35,6 +36,7 @@ LOWLIGHT_SCI_LEVELS = [("轻度 easy", "easy"), ("中度 medium", "medium"),
 
 # 背景图库缩略图尺寸
 BG_THUMB = (72, 41)
+FACE_THUMB = (72, 72)
 
 # 纯色背景预设：(显示名, 十六进制)。绿幕色便于后续做抠像演示
 COLOR_PRESETS = [
@@ -466,6 +468,148 @@ class SegmentPanel(QGroupBox):
         key = self.cmb_model.currentData()
         if key and self._on_model_change is not None:
             self._on_model_change(key)
+
+
+class FaceSwapPanel(QGroupBox):
+    """实时换脸：本地选择源脸、授权确认和效果开关。"""
+
+    def __init__(self, pipeline: Pipeline, parent=None):
+        super().__init__("换脸（演示级）", parent)
+        self.pipeline = pipeline
+        self.effect = pipeline.get_effect("faceswap")
+        p = self.effect.get_params()
+
+        lay = QVBoxLayout(self)
+        self.chk_consent = QCheckBox("我确认仅使用本人 / 已授权者 / 动漫形象")
+        self.chk_consent.setChecked(bool(p["consent"]))
+        self.chk_consent.toggled.connect(self._consent_changed)
+        lay.addWidget(self.chk_consent)
+
+        lay.addWidget(QLabel("内置脸库（均为原创虚构人物）"))
+        self.lst_faces = QListWidget()
+        self.lst_faces.setViewMode(QListWidget.ViewMode.IconMode)
+        self.lst_faces.setIconSize(QPixmap(*FACE_THUMB).size())
+        self.lst_faces.setGridSize(self.lst_faces.iconSize())
+        self.lst_faces.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.lst_faces.setFixedHeight(2 * (FACE_THUMB[1] + 20))
+        self.lst_faces.setMovement(QListWidget.Movement.Static)
+        self.lst_faces.itemClicked.connect(self._pick_gallery_source)
+        lay.addWidget(self.lst_faces)
+        self._load_face_gallery()
+
+        self.btn_source = QPushButton("自行上传源脸图片…")
+        self.btn_source.clicked.connect(self._pick_source)
+        lay.addWidget(self.btn_source)
+
+        self.lbl_preview = QLabel("尚未选择源脸")
+        self.lbl_preview.setFixedHeight(92)
+        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setStyleSheet(
+            "background:#111827;border:1px solid #334155;border-radius:6px;")
+        lay.addWidget(self.lbl_preview)
+
+        self.lbl_status = QLabel("请选择一张正面清晰照片")
+        self.lbl_status.setWordWrap(True)
+        lay.addWidget(self.lbl_status)
+
+        self.chk_color = QCheckBox("肤色匹配（Reinhard）")
+        self.chk_color.setChecked(bool(p["color_transfer"]))
+        self.chk_color.toggled.connect(
+            lambda on: self.pipeline.set_params("faceswap", color_transfer=on))
+        lay.addWidget(self.chk_color)
+
+        self.chk_enabled = QCheckBox("启用实时换脸")
+        self.chk_enabled.setChecked(self.effect.enabled)
+        self.chk_enabled.toggled.connect(self._enabled_changed)
+        lay.addWidget(self.chk_enabled)
+
+        path = str(p["source_path"])
+        if path:
+            self._show_source(path)
+        self._sync_enabled_state()
+
+    def _consent_changed(self, on: bool) -> None:
+        self.pipeline.set_params("faceswap", consent=on)
+        if not on:
+            self.chk_enabled.setChecked(False)
+        self._sync_enabled_state()
+
+    def _enabled_changed(self, on: bool) -> None:
+        allowed = bool(self.chk_consent.isChecked()
+                       and self.effect.get_params()["source_path"])
+        self.pipeline.set_enabled("faceswap", bool(on and allowed))
+        if on and not allowed:
+            self.chk_enabled.setChecked(False)
+
+    def _sync_enabled_state(self) -> None:
+        ready = bool(self.chk_consent.isChecked()
+                     and self.effect.get_params()["source_path"])
+        self.chk_enabled.setEnabled(ready)
+
+    def _pick_source(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择已获授权的源脸图片", "",
+            "图片 (*.jpg *.jpeg *.png *.bmp *.webp)")
+        if not path:
+            return
+        if load_image(path) is None:
+            self.lbl_status.setText("图片无法读取，请重新选择")
+            return
+        self._apply_source(path)
+
+    def _load_face_gallery(self) -> None:
+        paths = list_face_presets()
+        if not paths:
+            item = QListWidgetItem("内置脸库为空")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.lst_faces.addItem(item)
+            return
+        for path in paths:
+            image = load_image(path)
+            if image is None:
+                continue
+            h, w = image.shape[:2]
+            scale = min(FACE_THUMB[0] / w, FACE_THUMB[1] / h)
+            thumb = cv2.resize(
+                image, (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA)
+            qimg = QImage(thumb.data, thumb.shape[1], thumb.shape[0],
+                          3 * thumb.shape[1], QImage.Format.Format_BGR888)
+            stem = os.path.splitext(os.path.basename(path))[0]
+            label = stem.split("_", 1)[-1]
+            item = QListWidgetItem(QPixmap.fromImage(qimg), label)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(f"原创虚构人物：{label}")
+            self.lst_faces.addItem(item)
+
+    def _pick_gallery_source(self, item: QListWidgetItem) -> None:
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path:
+            self._apply_source(path)
+
+    def _apply_source(self, path: str) -> None:
+        self.pipeline.set_params("faceswap", source_path=path)
+        self._show_source(path)
+        self.lbl_status.setText(f"源脸已选择：{os.path.basename(path)}")
+        self._sync_enabled_state()
+        if self.chk_consent.isChecked():
+            self.chk_enabled.setChecked(True)
+
+    def _show_source(self, path: str) -> None:
+        image = load_image(path)
+        if image is None:
+            return
+        h, w = image.shape[:2]
+        qimg = QImage(image.data, w, h, 3 * w, QImage.Format.Format_BGR888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            270, 86, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        self.lbl_preview.setPixmap(pix)
+        self.lbl_preview.setToolTip(path)
+
+    def update_runtime_status(self, text: str) -> None:
+        if text and self.lbl_status.text() != text:
+            self.lbl_status.setText(text)
 
 
 class CapturePanel(QGroupBox):
