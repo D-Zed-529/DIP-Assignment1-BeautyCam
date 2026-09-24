@@ -7,8 +7,10 @@
     过手调高斯场与 MLS 全局变形两代；v5（当前）改为紧支撑 RBF 液化
     笔刷（core/liquify.py），下颌链沿轮廓法向内收 + 下巴尖上收，效果
     与性能详见 slim_face 注释与 docs/research-notes.md。
-  - 美白：默认全身肤色（含脖子/手臂），可用 whiten_scope="face" 退回
-    一期"仅脸部"口径；美白量随掩膜置信度渐变（软 alpha，无二值硬边）。
+  - 美白：默认"全身肤色"，但肤色检测约束在**人像区域**（脸框向下/两侧
+    扩展盖脖子肩，见 person_region_mask），排除背景同色误白；可用
+    whiten_scope="face" 退回一期"仅脸部"口径；美白量随掩膜置信度渐变
+    （软 alpha，无二值硬边）。
   - 美白掩膜：一期用 FaceDetection 框 + FaceMesh 轮廓双限制；v2 弃用
     FaceDetector（macOS Tasks 版崩溃，见 core/infer.py），仅用 FaceMesh
     轮廓多边形掩膜，语义等价且少一次前向。
@@ -19,15 +21,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import cv2
 import numpy as np
 
-from ..context import FrameContext
+from ..context import FaceInfo, FrameContext
 from ..liquify import rbf_liquify_maps
 from ..mls import identity_maps, mls_similarity_maps
-from ..pipeline import Effect, NEED_FACES
+from ..pipeline import Effect, NEED_FACES, NEED_SEGMENTATION
 from ..infer import FACE_OVAL_IDS
 
 # ------- 调参常量（模块顶部集中，中文注释） -------
@@ -36,6 +38,9 @@ SMOOTH_SIGMA = 60          #双边滤波颜色/空间 sigma（一期口径）
 SMOOTH_DOWNSCALE = 2       # 磨皮在 1/2 分辨率进行（皮肤低频，视觉等价）：
                            # 720p 双边 5.0ms → 半分辨率 ~1.6ms
 WHITEN_L_MAX = 30.0        # 美白滑杆上限（LAB L 增量；一期 15~18 推荐档）
+WHITEN_PERSON_SIDE = 0.5    # 人像区域两侧扩展（占脸宽比例）：盖住肩
+WHITEN_PERSON_DOWN = 1.2    # 人像区域向下扩展（占脸高比例）：盖住脖子 + 上胸
+WHITEN_PERSON_UP = 0.1      # 人像区域向上扩展（占脸高比例）
 SLIM_MAX_SHIFT_RATIO = 0.055   # 瘦脸强度=1.0 时的最大位移命令（占帧宽比例）
 SLIM_PROTECT_FADE_PX = 32.0     # 上半脸保护窗衰减带宽度（px）：眉线以上场→0
 SLIM_BRUSH_FACE_RATIO = 0.30   # v5 液化笔刷半径 = 0.30 × 脸宽（盖住脸颊主体）
@@ -145,6 +150,51 @@ def face_oval_mask(frame_bgr: np.ndarray, landmarks: np.ndarray) -> np.ndarray:
     pts = landmarks[FACE_OVAL_IDS][:, :2] * np.array([w, h])
     cv2.fillPoly(mask, [pts.astype(np.int32)], 255)
     return cv2.GaussianBlur(mask, (11, 11), 0)
+
+
+def person_region_mask(frame_bgr: np.ndarray,
+                       faces: Sequence[FaceInfo]) -> np.ndarray:
+    """人像区域掩膜：各脸框向下/两侧扩展覆盖脖子与肩，软羽化（0~255）。
+
+    用于美白"全身肤色"档：把肤色检测约束在人像附近，排除背景里同色
+    物体（米色墙 / 木纹 / 黄衣等）被误白。脸框来自 FaceMesh 轮廓关键点
+    （含下巴），向下扩展盖住脖子与上胸，两侧扩展盖住肩。无脸调用方不应
+    传入（调用方已保证 faces 非空）。
+    """
+    h, w = frame_bgr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for f in faces:
+        x1, y1, x2, y2 = f.box
+        fw = max(x2 - x1, 1e-3)
+        fh = max(y2 - y1, 1e-3)
+        l = max(x1 - WHITEN_PERSON_SIDE * fw, 0.0)
+        r = min(x2 + WHITEN_PERSON_SIDE * fw, 1.0)
+        t = max(y1 - WHITEN_PERSON_UP * fh, 0.0)
+        b = min(y2 + WHITEN_PERSON_DOWN * fh, 1.0)
+        cv2.rectangle(mask, (int(l * w), int(t * h)),
+                      (int(r * w), int(b * h)), 255, -1)
+    # 软羽化（1/4 分辨率宽高斯，性能同 autoenhance 羽化），避免矩形硬边
+    sh, sw = max(h // 4, 1), max(w // 4, 1)
+    small = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), 5.0)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def person_soft_mask_u8(person_alpha: Optional[np.ndarray],
+                        person_mask: Optional[np.ndarray]
+                        ) -> Optional[np.ndarray]:
+    """人像软掩膜（uint8 0~255）：优先分割软 alpha，退化到硬掩膜，都没有返回 None。
+
+    person_alpha 是多分类模型时背景有 ~0.084 的"鬼影地板"（见 segment.py 模块头），
+    先杀掉再转 uint8，避免背景被轻微带白。
+    """
+    if person_alpha is not None:
+        a = np.clip(person_alpha, 0.0, 1.0)
+        a[a < 0.1] = 0.0
+        return (a * 255.0).astype(np.uint8)
+    if person_mask is not None:
+        return person_mask
+    return None
 
 
 def whitening(frame_bgr: np.ndarray, mask: np.ndarray, strength: float) -> np.ndarray:
@@ -504,11 +554,18 @@ def slim_face_maps(w: int, h: int, landmarks: np.ndarray,
 
 
 class BeautyEffect(Effect):
-    """实时美颜链：磨皮 → 美白（肤色∩脸轮廓掩膜）→ 瘦脸/大眼 → 收尾锐化。"""
+    """实时美颜链：磨皮 → 美白（肤色∩人像掩膜）→ 瘦脸/大眼 → 收尾锐化。"""
 
     name = "beauty"
-    needs = frozenset({NEED_FACES})
     supports_gpu = True          # 张量快路径见 _torch_impl.beauty_process_t
+
+    @property
+    def needs(self) -> frozenset[str]:
+        """仅在启用精准美白时请求分割，避免普通美颜每帧额外推理。"""
+        p = self._p()
+        if p["whiten"] > 0 and p["whiten_scope"] == "skin" and p["whiten_precise"]:
+            return frozenset({NEED_FACES, NEED_SEGMENTATION})
+        return frozenset({NEED_FACES})
 
     @staticmethod
     def default_params() -> dict:
@@ -516,6 +573,7 @@ class BeautyEffect(Effect):
             "smooth": 0.6,       # 磨皮混合比 0~1（一期 0.6）
             "whiten": 15.0,      # 美白强度（LAB L 增量）0~30（一期 15）
             "whiten_scope": "skin",  # 美白范围："skin" 全身肤色 / "face" 仅脸部
+            "whiten_precise": False,  # 单独请求分割做精准美白；默认关闭以保持帧率
             "slim": 0.40,        # 瘦脸强度 0~1
             "eye_enabled": False,  # 大眼开关（一期默认关）
             "eye_strength": 0.18,   # 大眼强度 0~0.5（一期 0.18）
@@ -535,16 +593,26 @@ class BeautyEffect(Effect):
         if p["smooth"] > 0:
             frame = self._smooth(frame, p["smooth"])
 
-        # 2. 美白：默认全身肤色（脖子/手臂等皮肤一并提亮）；选"仅脸部"时
-        #    再与 FaceMesh 轮廓掩膜求交（一期口径）
+        # 2. 美白：肤色检测约束在"人像"上——优先用人像分割软掩膜（精确圈人，
+        #    排除背景同色误白），分割不可用则退回脸框扩展的人像区域；选
+        #    "仅脸部"时再与 FaceMesh 轮廓求交（一期口径）。无人脸不美白。
         if p["whiten"] > 0:
             skin = get_skin_mask(frame)
-            if p["whiten_scope"] == "face" and ctx.faces:
-                oval_total = np.zeros_like(skin)
-                for f in ctx.faces:
-                    oval_total = cv2.bitwise_or(
-                        oval_total, face_oval_mask(frame, f.landmarks))
-                skin = cv2.min(skin, oval_total)
+            if ctx.faces:
+                if p["whiten_scope"] == "face":
+                    oval_total = np.zeros_like(skin)
+                    for f in ctx.faces:
+                        oval_total = cv2.bitwise_or(
+                            oval_total, face_oval_mask(frame, f.landmarks))
+                    skin = cv2.min(skin, oval_total)
+                else:
+                    person = person_soft_mask_u8(ctx.person_alpha, ctx.person_mask)
+                    if person is not None:
+                        skin = cv2.min(skin, person)
+                    else:
+                        skin = cv2.min(skin, person_region_mask(frame, ctx.faces))
+            else:
+                skin = np.zeros_like(skin)
             if skin.any():
                 frame = whitening(frame, skin, p["whiten"])
 

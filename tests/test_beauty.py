@@ -12,8 +12,8 @@ import numpy as np
 
 from core.effects.beauty import (
     BeautyEffect, JAW_LEFT_IDS, JAW_RIGHT_IDS, enlarge_eyes, estimate_yaw_deg,
-    face_oval_mask, get_skin_mask, pose_gate, slim_face, slim_face_maps,
-    whitening,
+    face_oval_mask, get_skin_mask, person_region_mask, person_soft_mask_u8,
+    pose_gate, slim_face, slim_face_maps, whitening,
 )
 from core.mls import identity_maps
 import core.effects.beauty as B
@@ -243,36 +243,105 @@ class TestSlimFace(unittest.TestCase):
 
 
 class TestWhitenScope(unittest.TestCase):
-    """美白范围：默认全身肤色；whiten_scope=face 时才限定脸部。"""
+    """美白范围：默认"全身肤色"约束在人像区域（脸框扩展），背景同色不误白；
+    whiten_scope=face 时仅脸部椭圆。"""
 
-    def _frame_with_body_skin(self):
-        frame = synth_face_frame()
-        # 左侧背景铺一块纯"身体皮肤"色（模拟脖子/手臂），远离脸部椭圆
-        frame[:, :60] = np.uint8(SKIN_BGR)
+    BOX = (0.3, 0.2, 0.7, 0.8)   # 与 synth_face_landmarks 的脸椭圆一致
+
+    def _paint_skin(self, frame, x1, x2, y1, y2):
+        frame[y1:y2, x1:x2] = np.uint8(SKIN_BGR)
         return frame
 
-    def test_default_scope_whitens_body_skin(self):
-        frame = self._frame_with_body_skin()
+    def _ctx(self, frame):
+        lm = synth_face_landmarks(frame)
+        return FrameContext(width=frame.shape[1], height=frame.shape[0],
+                            faces=[FaceInfo(landmarks=lm, box=self.BOX)])
+
+    def _gray(self, frame):
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def test_skin_scope_whitens_neck_below_face(self):
+        """默认档：脸正下方的脖子（人像区域内）肤色应被美白。"""
+        frame = synth_face_frame()
+        self._paint_skin(frame, 280, 360, 410, 455)   # 脸椭圆底(y≈400)下方
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0})
+        out = eff.process(frame.copy(), self._ctx(frame))
+        before = self._gray(frame)[412:453, 282:358].mean()
+        after = self._gray(out)[412:453, 282:358].mean()
+        self.assertGreater(after, before + 3.0)
+
+    def test_skin_scope_ignores_background_skin(self):
+        """默认档：远离人脸的同色背景不应被美白。"""
+        frame = synth_face_frame()
+        self._paint_skin(frame, 0, 40, 0, 40)   # 左上角（人像区域外）
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0})
+        out = eff.process(frame.copy(), self._ctx(frame))
+        before = self._gray(frame)[2:38, 2:38].mean()
+        after = self._gray(out)[2:38, 2:38].mean()
+        self.assertAlmostEqual(after, before, delta=1.0)
+
+    def test_face_scope_leaves_neck(self):
+        """仅脸部档：脖子（脸椭圆下方）不应被美白。"""
+        frame = synth_face_frame()
+        self._paint_skin(frame, 280, 360, 410, 455)   # 脖子
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0,
+                                   "whiten_scope": "face"})
+        out = eff.process(frame.copy(), self._ctx(frame))
+        before = self._gray(frame)[412:453, 282:358].mean()
+        after = self._gray(out)[412:453, 282:358].mean()
+        self.assertAlmostEqual(after, before, delta=1.0)
+
+    def test_no_face_no_whiten(self):
+        """无人脸时不美白（避免整帧乱白肤色背景）。"""
+        frame = synth_face_frame()
+        self._paint_skin(frame, 0, 40, 0, 40)   # 背景肤色
         eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0})
         ctx = FrameContext(width=frame.shape[1], height=frame.shape[0])  # 无脸
         out = eff.process(frame.copy(), ctx)
-        before = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[:, 5:55].mean()
-        after = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)[:, 5:55].mean()
-        self.assertGreater(after, before + 3.0)
-
-    def test_face_scope_leaves_body_skin(self):
-        frame = self._frame_with_body_skin()
-        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0,
-                                   "whiten_scope": "face"})
-        lm = synth_face_landmarks(frame)
-        ctx = FrameContext(width=frame.shape[1], height=frame.shape[0],
-                           faces=[FaceInfo(landmarks=lm, box=(0.3, 0.2, 0.7, 0.8))])
-        out = eff.process(frame.copy(), ctx)
-        # 身体皮肤区域（取内部，避开边缘与收尾锐化的边界行）亮度不变
-        body = np.s_[5:-5, 5:55]
-        before = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)[body].mean()
-        after = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)[body].mean()
+        before = self._gray(frame)[2:38, 2:38].mean()
+        after = self._gray(out)[2:38, 2:38].mean()
         self.assertAlmostEqual(after, before, delta=1.0)
+
+    def test_person_region_geometry(self):
+        """person_region_mask：覆盖脸下方（脖子/肩），排除远处角落。"""
+        frame = synth_face_frame()
+        mask = person_region_mask(frame, self._ctx(frame).faces)
+        h, w = frame.shape[:2]
+        self.assertEqual(mask.shape, (h, w))
+        # 脸正下方（脖子，y≈440）在人像区域内
+        self.assertGreater(int(mask[440, 320]), 200)
+        # 远处左上角在人像区域外
+        self.assertLess(int(mask[10, 10]), 64)
+
+    def test_skin_scope_uses_segmentation_over_box(self):
+        """有分割软掩膜时用它（比脸框扩展更紧）圈人：框内但掩膜外的背景肤色不白。"""
+        frame = synth_face_frame()
+        self._paint_skin(frame, 100, 150, 200, 250)   # 脸左侧：框内、椭圆外
+        eff = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0})
+        ctx = self._ctx(frame)
+        h, w = frame.shape[:2]
+        alpha = np.zeros((h, w), np.float32)
+        cv2.ellipse(alpha, (w // 2, h // 2), (w // 5, h // 3), 0, 0, 360, 1.0, -1)
+        ctx.person_alpha = alpha          # 只圈脸椭圆的分割软掩膜
+        out = eff.process(frame.copy(), ctx)
+        before = self._gray(frame)[206:244, 106:144].mean()
+        after = self._gray(out)[206:244, 106:144].mean()
+        self.assertAlmostEqual(after, before, delta=1.0)
+
+    def test_person_soft_mask_ghost_floor_removed(self):
+        """多分类模型的背景鬼影地板（~0.08）应被清零，避免背景轻微带白。"""
+        h, w = 100, 100
+        alpha = np.full((h, w), 0.08, np.float32)   # 背景地板
+        alpha[40:60, 40:60] = 0.9                   # 前景
+        out = person_soft_mask_u8(alpha, None)
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(int(out[10, 10]), 0)       # 地板被清零
+        self.assertGreater(int(out[50, 50]), 200)   # 前景保留
+        # 无 alpha 退化到硬掩膜
+        mask = np.full((h, w), 255, np.uint8)
+        self.assertIs(person_soft_mask_u8(None, mask), mask)
+        # 都没有返回 None
+        self.assertIsNone(person_soft_mask_u8(None, None))
 
 
 class TestBeautyEffect(unittest.TestCase):
