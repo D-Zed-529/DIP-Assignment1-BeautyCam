@@ -19,10 +19,12 @@ tonemap 选项作为观感风格作用于融合结果（伪 HDR 域）。
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 # ------- 调参常量 -------
 # EV 组合预设：模拟包围曝光的档位（P1-1）。±1EV 三张为默认（覆盖大多数
@@ -155,15 +157,53 @@ def hdr_pipeline(frames_raw: list[np.ndarray],
     return tonemap_frame(merged, tonemap), exposed, merged
 
 
+# 中文字体候选路径（Pillow 画标签用；找不到就退回 ASCII，不影响产出）。
+# OpenCV 的 Hershey 字体只有 ASCII 字形，中文会渲染成一串「?」。
+_CJK_FONTS = (
+    "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+)
+_LABEL_FONT: Optional[ImageFont.FreeTypeFont] = None
+_LABEL_FONT_TRIED = False
+
+
+def _label_font(size: int = 22):
+    """懒加载中文字体；找不到可用字体返回 None（调用方退回 cv2 画 ASCII）。"""
+    global _LABEL_FONT, _LABEL_FONT_TRIED
+    if not _LABEL_FONT_TRIED:
+        _LABEL_FONT_TRIED = True
+        for path in _CJK_FONTS:
+            if os.path.exists(path):
+                try:
+                    _LABEL_FONT = ImageFont.truetype(path, size)
+                    break
+                except OSError:
+                    continue
+    return _LABEL_FONT
+
+
+def _label_image(img: np.ndarray, text: str) -> np.ndarray:
+    """在图上贴左上角标签（黑底白字）。用 Pillow 渲染中文字形。"""
+    out = img.copy()
+    font = _label_font()
+    if font is None:
+        # 无中文字体：退回 ASCII（标签会变「?」，但至少不崩）
+        cv2.putText(out, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        return out
+    pil = Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.rectangle((0, 0, box[2] + 16, box[3] + 10), fill=(0, 0, 0))
+    draw.text((8, 5), text, font=font, fill=(255, 255, 255))
+    return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+
+
 def build_hdr_comparison(single_bgr: np.ndarray, merged: np.ndarray,
                          final: np.ndarray, evs: tuple[float, ...]) -> np.ndarray:
     """「单张 vs 融合 vs 映射」横拼对照图（答辩素材，P1 验收要求）。"""
     panels = [single_bgr, merged, final]
     labels = [f"单张 0EV", "Mertens 融合", "融合+色调映射"]
-    strips = []
-    for img, label in zip(panels, labels):
-        strip = img.copy()
-        cv2.putText(strip, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        strips.append(strip)
-    return np.hstack(strips)
+    return np.hstack([_label_image(img, lab) for img, lab in zip(panels, labels)])
