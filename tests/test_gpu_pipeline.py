@@ -17,12 +17,49 @@ import cv2
 import numpy as np
 
 from core.infer import torch_backend_ready
-from core.pipeline import Pipeline
+from core.pipeline import Effect, Pipeline
 
 _ROOT = Path(__file__).resolve().parent.parent
 _SAMPLE = _ROOT / "assets" / "samples" / "portrait1.jpg"
 
 READY = torch_backend_ready() and _SAMPLE.exists()
+
+
+class _GpuAddEffect(Effect):
+    name = "gpu_add_test"
+    supports_gpu = True
+
+    @staticmethod
+    def default_params() -> dict:
+        return {}
+
+    def process(self, frame, ctx):
+        raise AssertionError("应走 GPU 路径")
+
+    def process_gpu(self, frame_t, ctx):
+        return frame_t + 20
+
+
+class _CpuAddEffect(Effect):
+    name = "cpu_add_test"
+
+    @staticmethod
+    def default_params() -> dict:
+        return {}
+
+    def process(self, frame, ctx):
+        if not np.all(frame == 30):
+            raise AssertionError("CPU 插件没有收到前一个 GPU 效果的结果")
+        return frame + 5
+
+
+class TestGpuCpuBoundary(unittest.TestCase):
+    def test_cpu_effect_receives_latest_gpu_frame(self):
+        from core.context import FrameContext
+        frame = np.full((4, 5, 3), 10, np.uint8)
+        pipeline = Pipeline([_GpuAddEffect(), _CpuAddEffect()], use_gpu=True)
+        out = pipeline.process(frame, FrameContext(width=5, height=4))
+        self.assertTrue(np.all(out == 35))
 
 
 def _sample_720p():

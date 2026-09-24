@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
 
 from demos.faceswap.faceswap import (
     delaunay_triangles, draw_wireframe, face_oval_poly, faceswap,
-    reinhard_color_transfer, warp_face,
+    reinhard_color_transfer, run, side_by_side, warp_face,
 )
 
 
@@ -69,6 +72,17 @@ class TestColorTransfer(unittest.TestCase):
         for c in range(3):
             self.assertLess(abs(lab_o[c] - lab_r[c]), abs(lab_p[c] - lab_r[c]))
 
+    def test_mask_ignores_black_pixels_outside_face(self):
+        patch = np.zeros((40, 40, 3), np.uint8)
+        patch[10:30, 10:30] = (200, 120, 80)
+        ref = np.full((40, 40, 3), (60, 180, 150), np.uint8)
+        mask = np.zeros((40, 40), np.uint8)
+        mask[10:30, 10:30] = 255
+        out = reinhard_color_transfer(patch, ref, mask)
+        self.assertTrue(np.array_equal(out[0, 0], patch[0, 0]))
+        self.assertLess(np.abs(out[20, 20].astype(int) - ref[20, 20]).mean(),
+                        np.abs(patch[20, 20].astype(int) - ref[20, 20]).mean())
+
 
 class TestFaceswapEndToEnd(unittest.TestCase):
     def _synth_mesh(self, cx, cy, r, n=468):
@@ -114,6 +128,27 @@ class TestFaceswapEndToEnd(unittest.TestCase):
         tris = delaunay_triangles(lm[:, :2] * np.array([100, 100]), (100, 100))
         out = draw_wireframe(img, lm, tris)
         self.assertGreater(int(out.sum()), 0)
+
+    def test_different_image_sizes_save_all_stages(self):
+        """源/目标图高度不同时，阶段并排图仍能生成。"""
+        src = np.full((120, 90, 3), 100, np.uint8)
+        dst = np.full((200, 160, 3), 160, np.uint8)
+        self.assertEqual(side_by_side(src, dst).shape[0], dst.shape[0])
+        src_lm = self._synth_mesh(0.5, 0.5, 0.3)
+        dst_lm = self._synth_mesh(0.5, 0.5, 0.3)
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / "源图.png"
+            dst_path = Path(tmp) / "目标图.png"
+            src_path.write_bytes(cv2.imencode(".png", src)[1].tobytes())
+            dst_path.write_bytes(cv2.imencode(".png", dst)[1].tobytes())
+            with patch("demos.faceswap.faceswap.detect_landmarks",
+                       side_effect=[src_lm, dst_lm]):
+                result = run(str(src_path), str(dst_path), str(Path(tmp) / "out"))
+            self.assertIsNotNone(result)
+            for name in ("stage1_landmarks.jpg", "stage2_delaunay.jpg",
+                         "stage3_warp.jpg", "stage4_clone.jpg",
+                         "stage5_result.jpg", "compare.jpg"):
+                self.assertTrue((Path(tmp) / "out" / name).is_file(), name)
 
 
 if __name__ == "__main__":

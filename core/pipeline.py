@@ -160,6 +160,7 @@ class Pipeline:
                     continue
                 except NotImplementedError:
                     pass             # 该效果当前不可 GPU 化：落回 CPU
+            if pending is not None:
                 frame = download_frame(pending)
                 pending = None
             frame = e.process(frame, ctx)

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import glob
 import os
-import sys
 import threading
+import platform
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -71,18 +71,14 @@ class CameraSource(ABC):
         self.release()
 
 
-def _camera_backend() -> int:
-    """按平台选 OpenCV 采集后端。
-
-    Windows 用 CAP_DSHOW（比默认 MSMF 打开快、枚举稳）；macOS 显式
-    AVFoundation（误选其他后端会打不开，见 LiveCamera 类注释）；
-    其余平台走 OpenCV 默认。
-    """
-    if sys.platform == "win32" and hasattr(cv2, "CAP_DSHOW"):
-        return cv2.CAP_DSHOW
-    if sys.platform == "darwin":
-        return cv2.CAP_AVFOUNDATION
-    return cv2.CAP_ANY
+def _camera_backends() -> list[tuple[str, int]]:
+    """Windows 优先 DirectShow，打不开时回退自动后端。"""
+    system = platform.system()
+    if system == "Windows":
+        return [("DirectShow", cv2.CAP_DSHOW), ("自动", cv2.CAP_ANY)]
+    if system == "Darwin":
+        return [("AVFoundation", cv2.CAP_AVFOUNDATION)]
+    return [("自动", cv2.CAP_ANY)]
 
 
 def scan_cameras(max_index: int = 4, warmup_reads: int = 2) -> list[dict]:
@@ -95,8 +91,14 @@ def scan_cameras(max_index: int = 4, warmup_reads: int = 2) -> list[dict]:
     """
     found: list[dict] = []
     for idx in range(max_index + 1):
-        cap = cv2.VideoCapture(idx, _camera_backend())
-        ok = cap.isOpened()
+        cap = None
+        for _, backend in _camera_backends():
+            candidate = cv2.VideoCapture(idx, backend)
+            if candidate.isOpened():
+                cap = candidate
+                break
+            candidate.release()
+        ok = cap is not None
         w = h = 0
         if ok:
             got = False
@@ -107,7 +109,8 @@ def scan_cameras(max_index: int = 4, warmup_reads: int = 2) -> list[dict]:
                     got = True
                     break
             ok = got
-        cap.release()
+        if cap is not None:
+            cap.release()
         if ok:
             found.append({"index": idx, "width": int(w), "height": int(h)})
     return found
@@ -147,16 +150,23 @@ class LiveCamera(CameraSource):
         self.last_error: str = ""
 
     def open(self) -> bool:
-        backend = _camera_backend()
+        system = platform.system()
+        backends = _camera_backends()
         for attempt in range(self.OPEN_RETRIES):
-            cap = cv2.VideoCapture(self.index, backend)
-            if not cap.isOpened():
-                cap.release()
+            cap = None
+            for _, backend in backends:
+                candidate = cv2.VideoCapture(self.index, backend)
+                if candidate.isOpened():
+                    cap = candidate
+                    break
+                candidate.release()
+            if cap is None:
+                hint = ("请在系统设置 → 隐私与安全性 → 摄像头中授权当前应用。"
+                        if system == "Darwin" else
+                        "请检查系统摄像头权限，并确认摄像头未被其他应用占用。")
                 self.last_error = (
                     f"摄像头#{self.index} 打不开（第 {attempt + 1} 次）。"
-                    "Windows 常见原因：设备被占用或索引不对（点「扫描摄像头」"
-                    "看可用列表）；macOS 常见原因：未授权（系统设置 → 隐私与"
-                    "安全性 → 摄像头，勾选运行 Python 的终端应用后重试）。")
+                    f"已尝试：{'、'.join(name for name, _ in backends)}。{hint}")
                 time.sleep(self.OPEN_RETRY_DELAY)
                 continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)

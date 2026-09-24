@@ -26,9 +26,9 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 | 低光增强（双引擎） | **SCI 快速档**（默认 ONNX Runtime；torch CUDA 为实验路径）+ **Retinexformer 质量档**（ICCV 2023，LOL-v1 25.16dB，~67ms，隔帧推理摊薄）；启发式基线保留（"经典 vs 深度"对比线） |
 | 自适应画质优化 | FaceMesh 分区统计直方图 → 人脸/背景各自 gamma 自动曝光 → CLAHE → 灰世界白平衡 → LAB 饱和度，统计量 EMA 时域平滑 |
 | 自动 HDR 拍照 | 连拍 → gamma 模拟包围曝光 → ECC 对齐 → Mertens 融合 → 可选 Drago/Reinhard 色调映射 |
-| 换脸（演示级） | FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → 泊松融合 → Reinhard 色彩迁移；每阶段存图；`--consent` 伦理门 |
+| 换脸（演示级） | 离线演示与相机实时预览；复用当前帧 FaceMesh，缓存源脸三角网；Delaunay 分块仿射 → 泊松融合 → Reinhard 色彩迁移；内置 4 张原创虚构头像，也可自行上传；CLI/GUI 均有授权确认门 |
 | 手势 / 笑脸拍照 | V 手势（墙钟持续 1s）+ 笑脸（blendshapes mouthSmile 置信度），torch 后端下 blendshapes 由 HUND 头部网络计算（146 点子集·像素坐标输入） |
-| GUI | PySide6 暗色主题：新增"深度渐进虚化"面板、低光引擎下拉（SCI/Retinexformer）、分割模型下拉（torch 后端默认 RVM） |
+| GUI | PySide6 暗色主题：深度渐进虚化、实时换脸、低光引擎（SCI/Retinexformer）、分割模型（torch 后端默认 RVM）等面板 |
 | headless CLI | `scripts/run_pipeline.py`：全部新参数（`--bokeh` / `--lowlight-engine` / `--seg-model rvm`） |
 
 照片按 `photos/{manual|v_sign|smile}_时间戳.jpg` 保存。
@@ -48,7 +48,8 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 │   ├── gestures.py / pipeline.py / mls.py / liquify.py
 │   └── effects/            #   beauty / lowlight(双引擎) / segment / hdr / autoenhance / bokeh
 ├── gui/                    # PySide6 界面（main_window / panels / workers / theme.qss）
-├── demos/faceswap/         # 换脸演示（Delaunay+泊松，--consent 伦理门）
+├── demos/faceswap/         # 离线/实时换脸（Delaunay+泊松，授权确认门）
+├── assets/faces/          # 实时换脸内置原创脸库
 ├── scripts/
 │   ├── download_models.py  #   拉取全部权重（mediapipe/RVM/Retinexformer/DA-v2）
 │   ├── convert_models.py   #   tflite/onnx → TorchScript（一次性）
@@ -57,7 +58,7 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 │   ├── run_pipeline.py     #   headless 批跑 CLI
 │   ├── bench.py            #   性能基准（GPU 时钟拉频口径）
 │   └── eval_lowlight.py    #   低光 PSNR/SSIM 客观评测
-├── tests/                  # 220 个单测（不依赖摄像头/GUI；缺权重自动跳过）
+├── tests/                  # 230 个单测（不依赖摄像头/GUI；缺权重自动跳过）
 ├── models/torch/           # TorchScript 权重（gitignore，convert_models.py 产出）
 ├── models/hf/              # Depth Anything V2（transformers 格式，gitignore）
 └── legacy/                 # 一期 Tkinter 单文件版（归档参考）
@@ -65,7 +66,7 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 
 ## 环境与运行（Windows + CUDA）
 
-Windows 11 / RTX 3060 Laptop（6GB）+ Python 3.12（CUDA 12.6 轮子）：
+Windows 11 / RTX 3060 Laptop（6GB）+ Python 3.12（CUDA 12.6 轮子）。摄像头优先使用 DirectShow，打不开时回退 OpenCV 自动后端；右侧可扫描并选择设备。
 
 ```bash
 # 1) 虚拟环境 + 依赖（torch 必须装 CUDA 轮子）
@@ -86,13 +87,14 @@ python scripts/calibrate_torch.py
 # 5) 启动 GUI（需摄像头 + 本地显示）
 python -m gui.main_window
 
-# 单测（220 个；CUDA/权重缺失的项自动跳过）
+# 单测（230 个；CUDA/权重缺失的项自动跳过）
 python -m unittest discover tests
 ```
 
 在 Windows 上也可以双击仓库根目录的 `start.bat` 启动；它会使用 `.venv` 中的 Python。运行 `start.bat --check` 可只检查 GUI 模块能否导入。
 
 实时预览默认只运行轻度美颜；V 手势和笑脸自动拍照需要手动勾选，开启后会额外运行对应模型。拍照面板的“流畅优先”默认在 540p 处理预览，成片仍以原始分辨率重新处理。多种增强效果同时开启时，建议先从低强度调起；经典低光的直方图均衡可能放大暗部原有的色阶。
+实时换脸位于右侧「换脸（演示级）」面板：选一张内置原创头像或自行上传源脸，确认使用权限后启用；可切换 Reinhard 肤色匹配。图片仅在本机处理，源脸关键点首次加载后缓存。
 实时摄像头由独立线程持续采集，处理线程只领取最新帧；当效果链慢于相机帧率时会跳过过期帧，降低预览延迟。GPU 推理含多次小模型前向与 CPU 决策，任务管理器里的低平均利用率不等于显卡还有可直接转化为帧率的算力。
 磨皮 GPU 路径利用额外显存展开邻域，减少 Windows 下小算子启动开销；540p 样图默认美颜整链约 21→14.5ms/帧，多效果（美颜＋自适应画质＋分割＋深度虚化）约 41→34ms/帧。此为预热后的离线样图处理耗时，不含摄像头取帧和界面显示。
 
@@ -159,6 +161,7 @@ python -m demos.faceswap.faceswap --src 源脸.jpg --dst 目标.jpg --out output
 ## 版本历史
 
 - **v3（2026-09-23）**：Windows + CUDA 迁移；推理全 GPU（TorchScript）；RVM 分割、Retinexformer 低光、Depth Anything V2 深度虚化三项模型升级/新增；同帧独立模型 CUDA stream 并发；220 单测。
+- **v3 合并（2026-09-24）**：接入队友的 Windows 摄像头回退、实时换脸与原创脸库；保留 CUDA 效果链并修复 GPU→CPU 插件交接；当前 230 单测。
 - **v2（2026-09）**：core/gui 分层 + PySide6 + 效果链插件；HDR / SCI 低光 / 虚拟背景 / 换脸 / 自适应画质；183 单测（macOS arm64 口径，详见 git 历史）。
 - **v1**：Tkinter 单文件版（`legacy/`）。
 

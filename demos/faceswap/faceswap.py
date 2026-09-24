@@ -115,34 +115,45 @@ def face_oval_poly(landmarks: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return pts.astype(np.float32)
 
 
-def reinhard_color_transfer(patch: np.ndarray, reference: np.ndarray
+def reinhard_color_transfer(patch: np.ndarray, reference: np.ndarray,
+                            mask: np.ndarray | None = None
                             ) -> np.ndarray:
     """Reinhard 色彩迁移（LAB 统计对齐）：patch 的色彩分布向 reference 靠拢。
 
     (x − μ_p) · σ_r / σ_p + μ_r，逐通道。σ 比值夹在 [1/3, 3] 防极端
-    方差（纯色补丁 σ≈0）把噪声放大。
+    方差（纯色补丁 σ≈0）把噪声放大。指定 mask 时只统计和修改脸部，
+    避免三角网边缘的黑色空白把肤色均值拉低。
     """
+    if mask is not None and mask.shape != patch.shape[:2]:
+        raise ValueError("色彩迁移掩膜尺寸必须与图像一致")
     lab_p = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_r = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float32)
+    valid = np.ones(patch.shape[:2], bool) if mask is None else mask > 0
+    if not np.any(valid):
+        return patch.copy()
     out = lab_p.copy()
     for c in range(3):
-        mp, mr = float(lab_p[:, :, c].mean()), float(lab_r[:, :, c].mean())
-        sp = max(float(lab_p[:, :, c].std()), 1e-3)
-        sr = max(float(lab_r[:, :, c].std()), 1e-3)
+        mp, mr = float(lab_p[:, :, c][valid].mean()), float(lab_r[:, :, c][valid].mean())
+        sp = max(float(lab_p[:, :, c][valid].std()), 1e-3)
+        sr = max(float(lab_r[:, :, c][valid].std()), 1e-3)
         ratio = float(np.clip(sr / sp, 1.0 / 3.0, 3.0))
-        out[:, :, c] = (lab_p[:, :, c] - mp) * ratio + mr
+        channel = out[:, :, c]
+        channel[valid] = (lab_p[:, :, c][valid] - mp) * ratio + mr
     return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8),
                         cv2.COLOR_LAB2BGR)
 
 
 def faceswap(src: np.ndarray, src_lm: np.ndarray,
              dst: np.ndarray, dst_lm: np.ndarray,
-             color_transfer: bool = True) -> np.ndarray:
-    """端到端换脸（已有关键点）：剖分 → 分块仿射 → 泊松融合 →（可选）色彩迁移。"""
+             color_transfer: bool = True,
+             triangles: list[tuple[int, int, int]] | None = None) -> np.ndarray:
+    """端到端换脸（已有关键点）：剖分 → 分块仿射 → 色彩迁移 → 泊松融合。"""
     h, w = dst.shape[:2]
     src_pts = src_lm[:, :2] * np.array([src.shape[1], src.shape[0]])
     dst_pts = dst_lm[:, :2] * np.array([w, h])
-    tris = delaunay_triangles(src_pts, (src.shape[0], src.shape[1]))
+    # 实时相机逐帧复用源脸的三角拓扑，避免每帧重复做 Delaunay 剖分。
+    tris = (triangles if triangles is not None else
+            delaunay_triangles(src_pts, (src.shape[0], src.shape[1])))
     warped, warp_mask = warp_face(src, src_pts, dst_pts, tris, (h, w))
 
     # 只在目标脸 oval 区域内取变形结果（剖分凸包略大于 oval，夹一夹）
@@ -154,7 +165,8 @@ def faceswap(src: np.ndarray, src_lm: np.ndarray,
         ys, xs = np.nonzero(region)
         patch = warped[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
         ref = dst[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
-        colorized = reinhard_color_transfer(patch, ref)
+        face_mask = region[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        colorized = reinhard_color_transfer(patch, ref, face_mask)
         warped[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = colorized
 
     # seamlessClone：梯度域融合，蒙版羽化 + 略外扩（融合区要有真像素梯度）
@@ -202,6 +214,15 @@ def detect_landmarks(img_bgr: np.ndarray) -> np.ndarray | None:
     return ctx.faces[0].landmarks if ctx.faces else None
 
 
+def side_by_side(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """保持宽高比，将不同尺寸的阶段图并排（以目标图高度为准）。"""
+    target_h = right.shape[0]
+    new_w = max(1, round(left.shape[1] * target_h / left.shape[0]))
+    interp = cv2.INTER_AREA if target_h < left.shape[0] else cv2.INTER_LINEAR
+    resized = cv2.resize(left, (new_w, target_h), interpolation=interp)
+    return np.hstack([resized, right])
+
+
 def run(src_path: str, dst_path: str, out_dir: str) -> str | None:
     """跑完整流程并存各阶段产物。返回结果图路径（检测不到脸返回 None）。"""
     src, dst = load_image(src_path), load_image(dst_path)
@@ -226,10 +247,10 @@ def run(src_path: str, dst_path: str, out_dir: str) -> str | None:
     dst_pts = dst_lm[:, :2] * np.array([w, h])
     tris = delaunay_triangles(src_pts, (src.shape[0], src.shape[1]))
 
-    save("stage1_landmarks.jpg", np.hstack([
-        draw_landmarks(src, src_lm), draw_landmarks(dst, dst_lm)]))
-    save("stage2_delaunay.jpg", np.hstack([
-        draw_wireframe(src, src_lm, tris), draw_wireframe(dst, dst_lm, tris)]))
+    save("stage1_landmarks.jpg", side_by_side(
+        draw_landmarks(src, src_lm), draw_landmarks(dst, dst_lm)))
+    save("stage2_delaunay.jpg", side_by_side(
+        draw_wireframe(src, src_lm, tris), draw_wireframe(dst, dst_lm, tris)))
     warped, _ = warp_face(src, src_pts, dst_pts, tris, (h, w))
     save("stage3_warp.jpg", warped)
 
