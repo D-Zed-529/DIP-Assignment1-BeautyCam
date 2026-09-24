@@ -1,7 +1,29 @@
-# TODO — BeautyCam v2
+# TODO — BeautyCam v2 → v3
 
 > 计划与架构见 [docs/PLAN.md](docs/PLAN.md)，选型依据见 [docs/research-notes.md](docs/research-notes.md)。
 > 人日为单人净工作量估算。完成一项勾一项；验收标准见 PLAN §4。
+
+## Phase 6 — Windows + CUDA 迁移与模型升级（2026-09-23，v3）
+
+> 背景：技术栈从 macOS/M4 迁移到 Windows/RTX 3060；算力富余后按"更大更好的模型"替换原有小模型。
+
+- [x] **C-1** 自研 tflite→torch 转换器（`scripts/tflite_to_torch.py`）：tflite2onnx/onnx2torch 在 Windows 实测不可用（布局传播/自定义算子/临时文件句柄五类坑）；直接解析 flatbuffer 复刻 22 种算子 + MediaPipe 自定义上采样（语义对照官方 transpose_conv_bias.cc）；7 个 tflite 全部转换 + 数值跑通
+- [x] **C-2** `scripts/convert_models.py` 重写（走 C-1 转换器；SCI 走 onnx2torch proto 内存路线绕开临时文件坑），10/10 TorchScript 产出
+- [x] **C-3** `scripts/calibrate_torch.py` 数值校准：对 mediapipe 基准 face_det 偏差 <0.005 / landmarks Δ≈0.002 / blendshapes 逐名一致 / 分割 alpha MAE 0.004；预处理常数定版（face_lm 256 像素域输出、blendshapes 146 点像素坐标输入、palm 检测 [0,1] 归一化）
+- [x] **C-4** `core/infer_torch.py` TorchInferenceEngine 全 GPU 推理链：检测→ROI（官方 scale 1.5 + 眼线定向）→关键点→blendshapes；跟踪状态机 + 检测/轨迹 IoU 去重（修"每轮刷新复制轨迹"bug：30 帧 1→4 递增）；自适应 presence 门限（修低清 0 脸 bug：presence 480 宽退化到 0.008）
+- [x] **C-5** 引擎自动选择（`get_engine`）：CUDA+TorchScript 就绪 → torch，否则 mediapipe（接口对齐，depth 请求在 mediapipe 下告警降级）
+- [x] **C-6** RVM 视频抠图接入（mobilenetv3 fp32 官方 TorchScript，~8ms/帧）：循环时域状态 + 尺寸变化/切源重置；SEGMENTER_SPECS/INTERVAL 扩展；GUI 下拉按后端过滤；resnet50 fp16 高质量档保留（离线出图）
+- [x] **C-7** Retinexformer 低光质量档（ICCV 2023 LOL-v1 25.16dB）：架构 vendor（去 einops/pdb，d×d 线性注意力 512 推理无压力）+ gdown 拉权重 + `get_lowlight_session(engine=)` 双引擎调度 + GUI/CLI 下拉；实测 67ms/帧（隔帧摊薄 34ms）
+- [x] **C-8** Depth Anything V2 Small 深度估计（P3-4 补上）：transformers 本地权重会话 + min/max EMA 归一化；FrameContext.depth + NEED_DEPTH 贯通
+- [x] **C-9** `core/effects/bokeh.py` 深度渐进虚化：焦平面对齐人物（人像中位深度）→ sigma 金字塔（1/4 分辨率域）逐像素插值 → 人像掩膜强制清晰；GUI BokehPanel + CLI `--bokeh` 组
+- [x] **C-10** 迁移修补：Windows 相册命令（os.startfile）、bench psapi、GPU 时钟拉频基准口径（gpu_spin）
+- [x] **C-11** 测试与文档：220 单测全绿（新增 torch 引擎跟踪稳定性/幻影拒检/RVM 探针/并发一致性/bokeh 纯函数/retinexformer 架构与低光引擎参数）；README/AGENTS/TODO 全面同步
+
+**Phase 6 验收**：220 单测 ✓；torch vs mediapipe 数值校准达标 ✓（calibrate_torch.py）；稳态性能：仅人脸 35ms（28fps）/ 人脸+RVM+深度 100ms（10fps）/ 全家桶（+bokeh 效果）~196ms ✓；实时预览 540p 人脸+RVM 推理入口并发约 9ms（顺序约 12ms）✓；真图批跑（RVM 虚化 + bokeh + Retinexformer 低光）出图正常 ✓；GUI 实机观感由用户运行 `python -m gui.main_window` 确认（无头环境限制）。
+
+---
+
+## Phase 0–5（v2，macOS 口径，已完成）
 
 ## Phase 0 — 重构底座（6–9 人日）
 
@@ -45,7 +67,7 @@
 - [x] **P3-1** `core/effects/segment.py`：人像掩膜 + 运动自适应 EMA 时域平滑（静止重平滑防抖、运动减轻防拖影）+ guided filter 边缘精修（自实现 He et al. 2010，与 `cv2.ximgproc` 数值一致到 1e-5，**不依赖 contrib**，macOS 可跑）（1d）
 - [x] **P3-2** 基础虚化：背景高斯模糊，强度滑杆映射 sigma；大 sigma 走"降采样→模糊→升采样"加速（0.5d）
 - [x] **P3-3** 背景替换：内置 `assets/backgrounds/` 图库（10 张，`scripts/make_backgrounds.py` 程序化生成，无版权风险）+ 用户自选图片（0.5d）
-- [ ] **P3-4**（进阶）Depth Anything V2 small ONNX：深度图渐进虚化（近清远糊）（+1.5d）
+- [x] **P3-4**（进阶）Depth Anything V2 Small：深度图渐进虚化（近清远糊）；v3 使用本地 Transformers 权重与 PyTorch CUDA 推理（+1.5d）
 - [x] **P3-5** GUI：`SegmentPanel`（模式下拉 + 图库缩略图选择器 + 自选图片 + 纯色预设 + 强度/matte 对比度/羽化/时域平滑滑杆 + 边缘精修开关 + 分割模型下拉）（0.5d）
 
 **Phase 3 验收**：掩膜边缘无明显抖动/镶边 ✓（实测掩膜边界与图像边界偏移 9.6px 的固有模糊经精修后最大梯度提升约 4 倍；绿幕合成无镶边）；虚化+美颜+低光三开 **13.8fps**（本机 Windows x86，基线——同机同推理但不开虚拟背景——仅 26.3fps；PLAN 的 ≥15fps 是 M4 Mac 上的口径，本机约慢一倍，差距来自机器而非本模块）。

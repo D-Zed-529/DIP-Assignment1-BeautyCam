@@ -232,6 +232,7 @@ class AutoEnhanceEffect(Effect):
 
     name = "autoenhance"
     needs = frozenset({NEED_FACES})
+    supports_gpu = True          # 张量快路径见 _torch_impl.autoenhance_process_t
 
     @staticmethod
     def default_params() -> dict:
@@ -243,6 +244,10 @@ class AutoEnhanceEffect(Effect):
             "saturation": 0.0,
             "smooth": 0.8,
         }
+
+    def process_gpu(self, frame_t, ctx: FrameContext):
+        from ._torch_impl import autoenhance_process_t
+        return autoenhance_process_t(frame_t, self, ctx)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Optional
 
@@ -32,7 +33,7 @@ from core.effects.hdr import (
 from core.gestures import AutoCaptureState, any_smiling, is_v_sign
 from core.infer import InferenceEngine
 from core.pipeline import (
-    NEED_FACES, NEED_HANDS, NEED_SEGMENTATION, Pipeline,
+    NEED_FACES, NEED_HANDS, NEED_SEGMENTATION, NEED_DEPTH, Pipeline,
 )
 
 # 自动拍照的触发器名（与 GUI 复选框一一对应）
@@ -72,17 +73,23 @@ class CameraWorker(QThread):
                  engine: InferenceEngine,
                  triggers: Optional[set[str]] = None,
                  display_size: tuple[int, int] = DISPLAY_SIZE,
+                 process_scale: float = 1.0,
                  parent=None):
         super().__init__(parent)
         self.source = source
         self.pipeline = pipeline
         self.engine = engine
         self.display_size = display_size
+        # 处理分辨率系数（流畅优先模式）：预览链在降采样帧上跑（像素域
+        # 开销近似按平方缩减），拍照时用原始全分辨率帧一次性重处理，
+        # 照片画质不受影响。GUI 可运行期修改（下一帧生效）。
+        self.process_scale = float(np.clip(process_scale, 0.25, 1.0))
         # 启用的自动触发器集合（GUI 可随时改，集合赋值本身原子）
         self.triggers: set[str] = triggers if triggers is not None else set()
         self._stop_flag = False
         self._capture_request = False    # 手动拍照请求（跨线程标志）
         self._segmenter_request: Optional[str] = None   # 待切换的分割模型
+        self._last_raw: Optional[np.ndarray] = None     # 最近一帧原始全分辨率
         # HDR 连拍请求：(EV 预设名, tonemap 方式) 或 None
         self._hdr_request: Optional[tuple[str, Optional[str]]] = None
         self._auto_state = AutoCaptureState()
@@ -131,16 +138,19 @@ class CameraWorker(QThread):
             self.source.release()
 
     def _loop(self) -> None:
-        empty_streak = 0          # 连续空帧计数（实时源偶发空帧用）
+        empty_since: Optional[float] = None  # 连续空帧的墙钟起点
         frame_index = 0           # 隔帧降载的相位来源（见 pipeline.infer_needs_for）
         self.pipeline.reset_temporal()   # 新采集源：作废旧掩膜/旧背景缓存
+        if hasattr(self.engine, "reset_temporal"):
+            self.engine.reset_temporal()  # torch 引擎的 RVM 循环状态也要断开
         while not self._stop_flag:
             ret, frame = self.source.read()
             if not ret or frame is None:
                 if self.source.continuous:
                     # 实时相机偶发空帧（对焦/曝光切换）：退避重试，连败才算故障
-                    empty_streak += 1
-                    if empty_streak > 150:   # ~15s 无帧视为设备故障
+                    if empty_since is None:
+                        empty_since = time.monotonic()
+                    if time.monotonic() - empty_since > 15.0:
                         self.failed.emit(
                             f"{self.source.name} 持续无帧，设备可能被占用或已断开")
                         break
@@ -148,7 +158,7 @@ class CameraWorker(QThread):
                     continue
                 self.source_finished.emit()
                 break
-            empty_streak = 0
+            empty_since = None
 
             if self._segmenter_request is not None:
                 # 分割模型切换（GUI 请求）：会话重建只在本线程做
@@ -179,8 +189,11 @@ class CameraWorker(QThread):
                 continue
 
             try:
-                ctx = self._infer(frame, frame_index)
-                frame = self.pipeline.process(frame, ctx)
+                self._last_raw = frame
+                with self._processing_scope():
+                    work = self._frame_for_process(frame)
+                    ctx = self._infer(work, frame_index)
+                    frame = self.pipeline.process(work, ctx)
             except Exception as exc:  # noqa: BLE001 —— 单帧兜底：坏帧跳过而非终止演示
                 self.status_message.emit(f"跳过一帧（处理异常：{exc}）")
                 frame_index += 1
@@ -228,20 +241,65 @@ class CameraWorker(QThread):
         nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
         return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
 
+    def _frame_for_process(self, frame: np.ndarray) -> np.ndarray:
+        """流畅优先模式：预览链在降采样帧上跑（拍照走原始帧重处理）。"""
+        s = self.process_scale
+        if s >= 0.999:
+            return frame
+        h, w = frame.shape[:2]
+        nw, nh = max(1, round(w * s)), max(1, round(h * s))
+        return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    def _processing_scope(self):
+        """torch 后端整帧关闭梯度元数据，降低大量小算子的调度成本。"""
+        if str(getattr(self.engine, "backend_name", "")).startswith("torch"):
+            import torch
+            return torch.inference_mode()
+        return nullcontext()
+
+    def _photo_fullres(self) -> Optional[np.ndarray]:
+        """拍照帧：处理分辨率低于原始时，用最近一帧原始分辨率重处理一遍
+        （一次性开销换照片画质；RVM/分割的时域状态在尺寸切换时自动作废
+        重建，下一帧预览不受影响）。"""
+        raw = self._last_raw
+        if raw is None:
+            return None
+        if self.process_scale >= 0.999:
+            return None    # 预览帧即全分辨率，由调用方直接用
+        needs = self.pipeline.infer_needs_for(0)
+        with self._processing_scope():
+            ctx = self.engine.process(
+                raw,
+                faces=NEED_FACES in needs, hands=NEED_HANDS in needs,
+                segmentation=NEED_SEGMENTATION in needs,
+                depth=NEED_DEPTH in needs,
+            )
+            return self.pipeline.process(raw.copy(), ctx)
+
     def _infer(self, frame: np.ndarray, frame_index: int) -> FrameContext:
         """统一推理：效果链的本帧需求 ∨ 手势触发需求。
 
         隔帧降载只作用于效果链需求 —— 手势/笑脸判定必须每帧，否则 V 手势的
-        持续时间判定会因缺帧而不断被打断。
+        持续时间判定会因缺帧而不断被打断。blendshapes（微笑置信度）只在
+        有笑脸触发器时才需要：纯美颜链省每脸一次 HUND 前向 + 同步。
         """
         needs = self.pipeline.infer_needs_for(frame_index)
-        if self.triggers:
-            needs |= {NEED_FACES, NEED_HANDS}
+        want_v_sign = TRIGGER_V_SIGN in self.triggers
+        want_smile = TRIGGER_SMILE in self.triggers
+        if want_v_sign:
+            needs.add(NEED_HANDS)
+        if want_smile:
+            needs.add(NEED_FACES)
+        kwargs = {}
+        if str(getattr(self.engine, "backend_name", "")).startswith("torch"):
+            kwargs["blendshapes"] = want_smile   # torch 引擎独有参数
         return self.engine.process(
             frame,
             faces=NEED_FACES in needs,
             hands=NEED_HANDS in needs,
             segmentation=NEED_SEGMENTATION in needs,
+            depth=NEED_DEPTH in needs,
+            **kwargs,
         )
 
     def _hdr_burst(self, first: np.ndarray, count: int
@@ -302,6 +360,12 @@ class CameraWorker(QThread):
         self.status_message.emit(f"📸 HDR 成片已保存（{len(evs)} 张融合 + 对照图）")
 
     def _save_photo(self, frame: np.ndarray, trigger: str) -> None:
+        if self.process_scale < 0.999:
+            # 流畅优先模式：照片用原始分辨率重处理（预览帧是降采样的）
+            self.status_message.emit("📸 正在出片（全分辨率处理）…")
+            full = self._photo_fullres()
+            if full is not None:
+                frame = full
         filename = os.path.join(
             PHOTOS_DIR,
             f"{trigger}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg")

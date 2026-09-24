@@ -255,6 +255,7 @@ class SegmentEffect(Effect):
 
     name = "segment"
     needs = frozenset({NEED_SEGMENTATION})
+    supports_gpu = True          # 张量快路径见 _torch_impl.segment_process_t
 
     @staticmethod
     def default_params() -> dict:
@@ -279,6 +280,14 @@ class SegmentEffect(Effect):
         self._bg_key: Optional[tuple] = None
         self._bg_cache: Optional[np.ndarray] = None
         self._last_alpha: Optional[np.ndarray] = None
+        # GPU 快路径的跨帧状态（与 CPU 侧独立，切后端自动断开）
+        self._prev_alpha_t = None
+        self._last_alpha_t = None
+        self._bg_gpu_cache: dict = {}
+
+    def process_gpu(self, frame_t, ctx):
+        from ._torch_impl import segment_process_t
+        return segment_process_t(frame_t, self, ctx)
 
     def set_params(self, **kwargs) -> None:
         """额外校验 mode 取值：非法模式若被静默接受，会悄悄地按纯色处理。"""
@@ -291,9 +300,14 @@ class SegmentEffect(Effect):
         """最近一帧实际用于合成的 alpha（全分辨率 float32），只读。
 
         供 headless 的 --seg-dump-alpha 与 GUI 排障使用：把它存成灰度图看一眼
-        "人是不是白的"，是识别掩膜整体反转最直接的手段。不进热路径。
+        "人是不是白的"，是识别掩膜整体反转最直接的手段。不进热路径
+        （GPU 路径存张量，这里按需物化）。
         """
-        return self._last_alpha
+        if self._last_alpha is not None:
+            return self._last_alpha
+        if self._last_alpha_t is not None:
+            return self._last_alpha_t[0, 0].float().cpu().numpy()
+        return None
 
     # ------- 推理降载声明 -------
 
@@ -316,6 +330,9 @@ class SegmentEffect(Effect):
         self._bg_key = None
         self._bg_cache = None
         self._last_alpha = None
+        self._prev_alpha_t = None
+        self._last_alpha_t = None
+        self._bg_gpu_cache = {}
 
     # ------- 帧处理 -------
 

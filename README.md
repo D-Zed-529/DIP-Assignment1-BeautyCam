@@ -1,27 +1,35 @@
 # DIP-26 · BeautyCam 智能美颜与动作识别相机
 
-数字图像处理（DIP）课程小组项目：基于 **Python + OpenCV + MediaPipe** 的桌面端实时美颜相机，支持手势 / 笑脸触发自动拍照。
+数字图像处理（DIP）课程小组项目：基于 **Python + OpenCV + PyTorch(CUDA)** 的桌面端实时美颜相机，支持手势 / 笑脸触发自动拍照。
 
-**当前版本：v2（Phase 0/1/2/3/4 功能开发完成，Phase 5 评测数据就绪）** —— core/gui 分层架构 + PySide6 界面 + 效果链插件模式；一期 Tkinter 版归档于 `legacy/`。
+**当前版本：v3（CUDA 迁移 + 模型升级完成）** —— 技术栈从 macOS/MediaPipe/CoreML 整体迁移到 **Windows + RTX GPU + PyTorch**，推理链全面 GPU 化，并按"算力富余换画质"的思路替换/新增了更大更好的模型：
 
-## v2 已实现功能
+| 组件 | v2（macOS / M4） | v3（Windows / RTX 3060） |
+|------|------------------|--------------------------|
+| 推理后端 | MediaPipe Tasks（CPU 委托） | **PyTorch TorchScript 全 GPU**（MediaPipe 自动回退） |
+| 人像分割 | selfie_segmenter 二元（250KB） | **RVM RobustVideoMatting**（视频抠图，发丝级 alpha + 时域一致） |
+| 低光增强 | SCI（54KB，快速档） | SCI 快速档 + **Retinexformer 质量档**（LOL-v1 SOTA 25.16dB） |
+| 深度估计 | 无 | **Depth Anything V2 Small**（新增，P3-4 补上） |
+| 效果 | 均匀背景虚化 | 均匀虚化 + **深度渐进虚化（单反感）** |
+
+FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 mediapipe 数值校准：landmark 平均偏差 0.002、分割 alpha MAE 0.004、blendshapes 逐名一致 —— 见 `scripts/calibrate_torch.py`）。
+
+## v3 已实现功能
 
 | 模块 | 说明 |
 |------|------|
 | 分层架构 | `core/`（处理核心，禁 import GUI）/ `gui/`（PySide6 壳）/ `scripts/`（headless 评测 CLI）严格分离 |
-| 采集源抽象 | `core/camera.py`：实时相机（1280×720 镜像）/ 视频文件 / 图片序列统一接口；弱光检测口径统一（灰度均值 < 60） |
-| 统一推理 | `core/infer.py`：MediaPipe **Tasks API** 单例会话（FaceMesh468+blendshapes / Hands21 / 自拍分割），每帧一次推理结果放 `FrameContext` 共享，效果内部禁止重复推理 |
-| 美颜（全参数化） | ① 双边滤波磨皮（混合比可调）② LAB 美白（默认**全身肤色**，含脖子/手臂；可切"仅脸部"=肤色∧轮廓掩膜；软 alpha 无硬边）③ 瘦脸（下颌链 liquify 内收，**真变形**，方向/作用域已修正）④ 大眼（remap 向量化 + 边缘羽化，替代一期逐像素循环）⑤ 收尾锐化 |
-| **人像虚化 / 背景替换（Phase 3）** | `core/effects/segment.py`：三档模式（**背景虚化 / 换背景图 / 纯色**，对齐腾讯会议虚拟背景）。人像掩膜 = 二元自拍分割 → 运动自适应 EMA 时域平滑（静止防抖、运动防拖影）→ **guided filter 边缘精修**（自实现 He et al. 2010，边缘最大梯度提升约 4 倍）；内置 10 张程序化背景图库 + 用户自选图片 + 纯色预设。实测效果本体 15.2ms/帧 |
-| 低光增强（Phase 2） | 双引擎可切：**SCI 深度模型**（CVPR 2022，ONNX 54KB、固定 512×512 推理 + 上采样、easy/medium/difficult 三档、隔帧复用降载、亮度自动触发；CoreML EP 实测 1.7ms/次 vs CPU 7.4ms，**4.3 倍**，合成暗图 PSNR 22.1dB 启发式 14.4dB）与一期启发式基线（线性增益+直方图均衡）共存，构成"经典 vs 深度"对比线 |
-| **自适应画质优化** | `core/effects/autoenhance.py`：全时段经典 DIP 画面校正（与低光增强互补——本效果管逆光脸黑/轻度过曝/偏色/发灰等常态问题）。**FaceMesh 轮廓分区统计**直方图 → 人脸/背景各自 gamma 自动曝光（目标 150/115，容差带防抖，幂变换 LUT 按软掩膜混合）→ CLAHE 对比度 → **灰世界白平衡**（背景区估计，避开肤色污染）→ LAB 饱和度；统计量参数级 EMA 时域平滑防闪。人脸区域复用美颜的 FaceMesh 推理，零额外模型；实测效果本体 14.6ms/帧 |
-| **自动 HDR 拍照（Phase 1）** | `core/effects/hdr.py`：连拍（0.12s 间隔采集自然抖动）→ gamma LUT 模拟包围曝光（macOS 不支持手动曝光的关键绕坑决策）→ findTransformECC 帧间对齐 → MergeMertens 融合 → 可选 Drago/Reinhard 色调映射；成片/各 EV 原图/对照图一并存档 |
-| **换脸（演示级，Phase 4）** | `demos/faceswap/`：FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → seamlessClone 泊松融合 → Reinhard 色彩迁移；**每阶段中间产物存图**（课堂讲解素材）；CLI `--consent` 强制伦理确认（仅本人/授权/动漫形象） |
-| 手势拍照 | 剪刀手判定不变（食指+中指伸直、夹角 15°–65°），**改用墙钟时间持续 1s 判定**（一期帧计数在帧率波动时不稳） |
-| 笑脸拍照 | FaceBlendshapes `mouthSmile` 置信度 > 0.45 持续 0.5s（比一期嘴部张合更抗头姿干扰），缺失时自动回退一期口径 |
-| GUI | PySide6 暗色主题：视频区 + 效果面板（开关/滑杆）+ 采集源选择（摄像头/视频文件）+ 拍照预览条（点击放大）+ 状态栏 FPS |
-| 线程模型 | QThread 工作线程只发信号不碰控件；参数走 `pipeline.set_params()`（锁保护）；**一期 global 缺失 / 双线程两个 bug 已根治** |
-| headless CLI | `scripts/run_pipeline.py`：图片目录/视频批跑管线出评测数据；虚拟背景支持三档模式、模型切换、**边缘处理对比图一键产出**（答辩素材） |
+| **统一推理（双后端）** | `core/infer.py::get_engine()` 自动选择：CUDA + TorchScript 就绪 → `TorchInferenceEngine`（全 GPU，含跟踪状态机），否则回退 MediaPipe CPU。每帧一次推理结果放 `FrameContext` 共享 |
+| 美颜（全参数化） | 双边滤波磨皮 / LAB 美白（全身肤色或仅脸部）/ 瘦脸（下颌链 liquify 真变形）/ 大眼（remap 向量化）/ 收尾锐化 |
+| **RVM 人像抠图** | 官方 TorchScript（mobilenetv3 fp32，~8ms/帧@720p），4 层循环时域状态，发丝级 alpha；隔帧降载、边缘精修（guided filter）全保留；resnet50 高质量档可切换（离线出图） |
+| **深度渐进虚化（P3-4）** | Depth Anything V2 相对深度 → 焦平面对齐人物 → 模糊量随深度连续变化（sigma 金字塔 + 相邻档插值），观感对齐单反镜头 |
+| 低光增强（双引擎） | **SCI 快速档**（默认 ONNX Runtime；torch CUDA 为实验路径）+ **Retinexformer 质量档**（ICCV 2023，LOL-v1 25.16dB，~67ms，隔帧推理摊薄）；启发式基线保留（"经典 vs 深度"对比线） |
+| 自适应画质优化 | FaceMesh 分区统计直方图 → 人脸/背景各自 gamma 自动曝光 → CLAHE → 灰世界白平衡 → LAB 饱和度，统计量 EMA 时域平滑 |
+| 自动 HDR 拍照 | 连拍 → gamma 模拟包围曝光 → ECC 对齐 → Mertens 融合 → 可选 Drago/Reinhard 色调映射 |
+| 换脸（演示级） | FaceMesh → Delaunay 三角剖分 → 分块仿射变形 → 泊松融合 → Reinhard 色彩迁移；每阶段存图；`--consent` 伦理门 |
+| 手势 / 笑脸拍照 | V 手势（墙钟持续 1s）+ 笑脸（blendshapes mouthSmile 置信度），torch 后端下 blendshapes 由 HUND 头部网络计算（146 点子集·像素坐标输入） |
+| GUI | PySide6 暗色主题：新增"深度渐进虚化"面板、低光引擎下拉（SCI/Retinexformer）、分割模型下拉（torch 后端默认 RVM） |
+| headless CLI | `scripts/run_pipeline.py`：全部新参数（`--bokeh` / `--lowlight-engine` / `--seg-model rvm`） |
 
 照片按 `photos/{manual|v_sign|smile}_时间戳.jpg` 保存。
 
@@ -29,137 +37,129 @@
 
 ```
 .
-├── core/                  # 处理核心（禁止 import GUI 库）
-│   ├── camera.py          #   采集源抽象：相机 / 视频 / 图片序列
-│   ├── context.py         #   FrameContext：每帧共享推理结果
-│   ├── infer.py           #   MediaPipe Tasks 单例会话 + SCI 低光 ONNX 会话（CoreML EP）
-│   ├── gestures.py        #   V 手势/笑脸判定 + 自动拍照状态机
-│   ├── pipeline.py        #   Effect 基类 + 有序效果链（线程安全参数 + 隔帧降载）
-│   └── effects/           #   beauty.py / lowlight.py（启发式+SCI）/ segment.py / hdr.py
-├── gui/                   # PySide6 界面
-│   ├── main_window.py     #   主窗口（python -m gui.main_window）
-│   ├── panels.py          #   效果控制面板（美颜/低光/虚化/HDR/拍照）
-│   ├── workers.py         #   QThread 相机工作线程（信号发帧 + HDR 连拍）
-│   └── theme.qss          #   暗色主题（卡片化 + 徽章体系）
-├── demos/faceswap/        # 换脸演示（Delaunay+泊松，过程可视化，--consent 伦理门）
+├── core/                   # 处理核心（禁止 import GUI 库）
+│   ├── camera.py           #   采集源抽象：相机 / 视频 / 图片序列
+│   ├── context.py          #   FrameContext（faces/hands/person_alpha/depth）
+│   ├── infer.py            #   引擎工厂（torch/mediapipe 自动选择）+ ONNX 回退会话
+│   ├── infer_torch.py      #   TorchInferenceEngine：FaceMesh/Hands/RVM/DA-v2 全 GPU
+│   ├── gpuops.py           #   GPU 图像算子库（帧上传/滤波/引导滤波/CLAHE…）
+│   ├── depthany.py         #   Depth Anything V2 Small 会话（transformers）
+│   ├── retinexformer.py    #   Retinexformer 架构（vendor）+ LOL-v1 会话
+│   ├── gestures.py / pipeline.py / mls.py / liquify.py
+│   └── effects/            #   beauty / lowlight(双引擎) / segment / hdr / autoenhance / bokeh
+├── gui/                    # PySide6 界面（main_window / panels / workers / theme.qss）
+├── demos/faceswap/         # 换脸演示（Delaunay+泊松，--consent 伦理门）
 ├── scripts/
-│   ├── download_models.py #   拉取 MediaPipe + SCI 模型到 models/
-│   ├── make_backgrounds.py#   程序化生成虚拟背景图库（无版权风险）
-│   ├── run_pipeline.py    #   headless 批跑 CLI
-│   ├── bench.py           #   性能基准（各功能分解 + CPU vs CoreML 对比）
-│   └── eval_lowlight.py   #   低光增强 PSNR/SSIM 客观评测
-├── tests/                 # 纯函数单测（不依赖摄像头/GUI）
-├── assets/samples/        # 测试样例图
-├── assets/backgrounds/    # 虚拟背景图库（10 张，程序化生成）
-├── legacy/                # 一期 Tkinter 单文件版（归档参考）
-├── docs/                  # PLAN.md / research-notes.md
-├── TODO.md                # 分阶段任务清单
-└── models/                # 模型权重（gitignore，不入库）
+│   ├── download_models.py  #   拉取全部权重（mediapipe/RVM/Retinexformer/DA-v2）
+│   ├── convert_models.py   #   tflite/onnx → TorchScript（一次性）
+│   ├── tflite_to_torch.py  #   自研 TFLite→torch 转换器（tflite2onnx 在 Windows 不可用）
+│   ├── calibrate_torch.py  #   torch vs mediapipe 数值校准（定版工具）
+│   ├── run_pipeline.py     #   headless 批跑 CLI
+│   ├── bench.py            #   性能基准（GPU 时钟拉频口径）
+│   └── eval_lowlight.py    #   低光 PSNR/SSIM 客观评测
+├── tests/                  # 220 个单测（不依赖摄像头/GUI；缺权重自动跳过）
+├── models/torch/           # TorchScript 权重（gitignore，convert_models.py 产出）
+├── models/hf/              # Depth Anything V2（transformers 格式，gitignore）
+└── legacy/                 # 一期 Tkinter 单文件版（归档参考）
 ```
 
-## 环境与运行
+## 环境与运行（Windows + CUDA）
 
-macOS（arm64）+ Python 3.12：
+Windows 11 / RTX 3060 Laptop（6GB）+ Python 3.12（CUDA 12.6 轮子）：
 
 ```bash
-# 创建并激活虚拟环境（注意 PATH 中 python3 是 3.11，必须显式指定 3.12）
-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12 -m venv .venv
-source .venv/bin/activate
-
-# 安装依赖（mediapipe 必须锁 0.10.x，见下方"重要坑"）
+# 1) 虚拟环境 + 依赖（torch 必须装 CUDA 轮子）
+python -m venv .venv
+.venv\Scripts\activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 
-# 拉取模型权重（models/ 不入库）
+# 2) 拉取模型权重（mediapipe 系 + RVM + Retinexformer(gdown) + Depth Anything V2）
 python scripts/download_models.py
 
-# 启动 GUI（需摄像头权限 + 本地显示）
+# 3) tflite/onnx → TorchScript 转换（一次性；产出 models/torch/*.ts）
+python scripts/convert_models.py
+
+# 4) （可选）torch vs mediapipe 数值校准（部署自检）
+python scripts/calibrate_torch.py
+
+# 5) 启动 GUI（需摄像头 + 本地显示）
 python -m gui.main_window
 
-# 单测
+# 单测（220 个；CUDA/权重缺失的项自动跳过）
 python -m unittest discover tests
-
-# 生成虚拟背景图库（已入库，一般无需重跑）
-python scripts/make_backgrounds.py
-
-# headless 批跑（评测数据生产线）
-python scripts/run_pipeline.py --input assets/samples --output outputs/
-python scripts/run_pipeline.py --input 某视频.mp4 --no-beauty --lowlight --max-frames 100
-
-# SCI 深度低光增强（Phase 2 主力档）
-python scripts/run_pipeline.py --input assets/samples --no-beauty \
-    --lowlight-dnn --lowlight-level medium --lowlight-force
-
-# 换脸演示（Phase 4；--consent 为伦理确认门，详见 demos/faceswap/README.md）
-python -m demos.faceswap.faceswap --src 源脸.jpg --dst 目标.jpg \
-    --out outputs/faceswap --consent
-
-# 低光客观评测（PSNR/SSIM：SCI vs 启发式 vs 不增强）
-python scripts/eval_lowlight.py --input assets/samples --save-compare
-
-# 性能基准（各功能耗时分解 + SCI 的 CPU vs CoreML 对比）
-python scripts/bench.py --markdown-out outputs/bench.md
-
-# 虚拟背景：换背景图 / 背景虚化 / 纯色
-python scripts/run_pipeline.py --input assets/samples --segment \
-    --seg-mode image --seg-bg assets/backgrounds/02_冷色渐变.jpg
-python scripts/run_pipeline.py --input assets/samples --segment --seg-mode blur
-
-# 边缘处理四档对比图（答辩素材）
-
-python scripts/run_pipeline.py --input assets/samples --segment --seg-mode color \
-    --seg-bg-color "#00B140" --seg-compare
-# 加 --seg-model selfie_segmenter 用多分类模型对比（155ms/帧，仅适合离线出图）
-# 加 --seg-dump-alpha 另存 alpha 灰度图（人应是白的）
 ```
 
-### 重要坑（P0-1 冒烟结论，2026-09 本机实测）
+在 Windows 上也可以双击仓库根目录的 `start.bat` 启动；它会使用 `.venv` 中的 Python。运行 `start.bat --check` 可只检查 GUI 模块能否导入。
 
-- **mediapipe 必须用 0.10.x**（锁 `0.10.21`）：
-  - 1.0.x 已移除旧 `mp.solutions` API；
-  - 且 1.0.x 的 Tasks 检测类图（FaceDetector/FaceLandmarker/HandLandmarker）在本机（macOS darwin 27）**Open() 阶段 Metal 服务硬崩溃**（CPU/GPU 委托均崩，SIGABRT 无法被 Python 捕获），仅 ImageSegmenter 在 CPU 委托下可用。
-  - 0.10.21 的 Tasks API + 显式 CPU 委托全部正常（`core/infer.py` 已固定此配置）。
-- **FaceDetector 已弃用**：除上述崩溃外，人脸框可由 FaceMesh 轮廓关键点导出（`_landmarks_to_face_info`），还省一次前向。
-- 模型下载地址部分已 404，`scripts/download_models.py` 内是实测可用的 URL 清单。
-- 一期"已知问题"（`v_sign_frames`/`smile_start_time` 缺 global、双线程启动）在 v2 架构下已根治，详情见 `legacy/beautycam_v1.py` 归档。
+实时预览默认只运行轻度美颜；V 手势和笑脸自动拍照需要手动勾选，开启后会额外运行对应模型。拍照面板的“流畅优先”默认在 540p 处理预览，成片仍以原始分辨率重新处理。多种增强效果同时开启时，建议先从低强度调起；经典低光的直方图均衡可能放大暗部原有的色阶。
+实时摄像头由独立线程持续采集，处理线程只领取最新帧；当效果链慢于相机帧率时会跳过过期帧，降低预览延迟。GPU 推理含多次小模型前向与 CPU 决策，任务管理器里的低平均利用率不等于显卡还有可直接转化为帧率的算力。
+磨皮 GPU 路径利用额外显存展开邻域，减少 Windows 下小算子启动开销；540p 样图默认美颜整链约 21→14.5ms/帧，多效果（美颜＋自适应画质＋分割＋深度虚化）约 41→34ms/帧。此为预热后的离线样图处理耗时，不含摄像头取帧和界面显示。
 
-### 重要坑（P3-0 分割模型冒烟结论，2026-09 实测）
+headless 批跑与出图（评测数据生产线）：
 
-- **分割模型默认用二元 `selfie_segmenter.tflite`（250KB）而非多分类**：多分类 `selfie_multiclass_256x256.tflite`（16.4MB）实测 **155ms/帧**，且耗时与输入分辨率无关（降到 256×144 也一样，不取任何输出仍 ~142ms）——瓶颈纯在模型推理，直接接虚拟背景只有 ~7fps。二元模型 **13.2ms/帧**，快 11.7 倍，而虚拟背景只需要"人/非人"二分类。多分类保留为可切换选项，用于"质量 vs 速度"对比。
-- **⚠️ 两个模型的类别编码与置信图极性恰好相反**：
-  - 二元：类别 `0 = 人 / 255 = 背景`，`confidence_masks[0]` 是**人**的概率
-  - 多分类：类别 `0 = 背景 / 1..5 = 人`，`confidence_masks[0]` 是**背景**的概率
+```bash
+python scripts/run_pipeline.py --input assets/samples --output outputs/
 
-  搞反**不会抛异常**，只会静默产出整体反相的掩膜（人景对调）或全幅掩膜（背景替换毫无效果），是这块最隐蔽的坑。约定显式声明在 `core/infer.py` 的 `SEGMENTER_SPECS`，并由三道防线兜底：探针式单测（用"图像四角必为背景"这种与掩膜语义无关的参照）、模型约定相反性断言、运行时边框先验自检告警。
-- **多分类模型的背景置信度有系统偏置**（背景区 alpha 恒为 ~0.084，而非 0）。直接当 alpha 用会给新背景叠一层均匀的 8.4% 鬼影（背景发灰、颜色不实），靠 `matte_contrast` 对比度拉伸归零。二元模型无此问题。
-- **不要依赖 `cv2.ximgproc`**：项目主目标的 macOS 上 opencv-python 不含 contrib。guided filter 已自实现（纯 `cv2.boxFilter`，与 ximgproc 版本数值一致到 1e-5）。
-- **不要用 `cv2.imread`/`cv2.imwrite` 读写非 ASCII 路径**：Windows 上 `imread` 静默返回 `None`、`imwrite` 会**写到乱码文件名**且不报错。统一走 `np.fromfile`/`Path.write_bytes` + `cv2.imdecode`/`cv2.imencode`（见 `core/effects/segment.py::load_image`）。
+# RVM 虚拟背景三档（torch 后端默认 rvm；--seg-model 可切 binary/multiclass 对比）
+python scripts/run_pipeline.py --input assets/samples --segment --seg-mode blur
+python scripts/run_pipeline.py --input assets/samples --segment --seg-mode image --seg-bg assets/backgrounds/02_冷色渐变.jpg
 
-## 性能基线（1280×720，2026-09 实测，Apple M4）
+# 深度渐进虚化（近清远糊，焦平面对齐人物）
+python scripts/run_pipeline.py --input assets/samples --no-beauty --bokeh --bokeh-strength 0.9
 
-**美颜链性能优化（Phase 5）**：磨皮双边滤波降半分辨率（5.0→1.6ms）、肤色掩膜半分辨率（1.3→0.6ms）、美白 boundingRect 定位（3.1→0.8ms）、瘦脸 ROI remap（5.7→2.4ms，与全帧逐位一致有单测锁定）、亮度检测缩略图（0.4→0.1ms）——**美颜全链 18.4→9.4ms（1.96 倍）**，且全部不改数值结果（逐位等价）。
+# 低光双引擎：SCI 快速档 / Retinexformer 质量档
+python scripts/run_pipeline.py --input assets/samples --no-beauty --lowlight-dnn --lowlight-force
+python scripts/run_pipeline.py --input assets/samples --no-beauty --lowlight-dnn --lowlight-engine retinex --lowlight-force
 
-| 链路 | 优化前 | 优化后 |
-|------|---------|--------|
-| 美颜全链（含 FaceMesh） | 26.6 ms（37.6 fps） | **17.6 ms（56.8 fps）** |
-| 美颜 + 虚化 | 41.6 ms（24.0 fps） | **36.3 ms（27.6 fps）** |
-| 美颜 + 虚化 + 低光 | 43.7 ms（22.9 fps） | **35.4 ms（28.3 fps）** |
+# 低光客观评测 / 性能基准 / 换脸演示（同 v2）
+python scripts/eval_lowlight.py --input assets/samples --save-compare
+python scripts/bench.py --markdown-out outputs/bench.md
+python -m demos.faceswap.faceswap --src 源脸.jpg --dst 目标.jpg --out outputs/faceswap --consent
+```
 
-GUI 另有 worker 侧预缩放（帧在 worker 线程缩到显示尺寸，主线程零缩放，只做 QImage 包装）。
+## 重要坑（CUDA 迁移实测记录，2026-09）
 
-**推理分解**：FaceMesh 8.3ms / Hands 12.5ms（按需才跑）/ 分割二元 9.1ms / SCI 低光 CoreML **1.7ms** vs CPU 7.4ms（4.3 倍）。
+- **tflite2onnx + onnx2torch 在 Windows 上不可用**（face_landmarks 布局传播 IndexError、HARD_SWISH / 自定义算子 Convolution2DTransposeBias 不支持、SUM 无映射；onnx2torch 的 shape inference 落盘临时文件句柄独占 PermissionError）→ 自研转换器 `scripts/tflite_to_torch.py` 直接解析 flatbuffer 构建 torch 模块（含 MediaPipe 自定义上采样算子，语义对照官方 transpose_conv_bias.cc 实现）。
+- **face_landmarker.task 的 landmarks 模型输入是 256×256**（不是老的 192），输出 478×3 在 **256 像素域**（要 /256）；blendshapes 模型输入**不是图像**，是 146 点子集的**像素坐标** (1,146,2)，输出 52 维原始 0~1 值（mouthSmileLeft/Right = 下标 44/45）。
+- **presence = sigmoid(Identity_1) 有低清退化**：同一张脸在 480 宽整幅上 presence 只有 0.0076（960 宽裁剪上 0.985），而幻影框恒 ≈0。绝对阈值 0.5 会把低清真脸整个拒掉 → 自适应门限（绝对 0.5 或相对帧内最大值 ×0.4，见 `core/infer_torch.py` 模块头标定记录）。
+- **跟踪必须做检测/轨迹去重**（bbox IoU > 0.3 视为同一张脸），否则每轮检测刷新复制一份轨迹（实测 30 帧 1→4 递增）。
+- **RVM 官方 TorchScript 的 fp16 版**（resnet50）输入/参数全 half，3060 上反而比 fp32 慢 16 倍（131ms vs 8ms）→ 默认 mobilenetv3 fp32。
+- **笔记本 GPU 空闲即降频**，短基准虚高 3~50 倍：基准前必须空转拉时钟（`bench.py::gpu_spin`）；首次推理另有 ~15s 冷启动（模型加载）。
+- **竖版图直接 resize 到 16:9 会把脸压扁到 FaceMesh 检测不到**：一律等比缩放 + 补边（AGENTS.md 坑 #14，对 torch 后端同样成立）。
+- v2 的全部已知坑（mediapipe 版本、分割极性、cv2.imread 中文路径、ECC 方向、Drago NaN 等）见 AGENTS.md，多数只影响 mediapipe 回退路径。
 
-分割模型选型对比：二元 13.2ms/帧（每帧可跑）vs 多分类 155ms/帧（必须隔帧，已实现通用 `inference_interval` 隔帧降载机制）。
+## 性能基线（1280×720，2026-09 实测，RTX 3060 Laptop 6GB / torch:cuda）
 
-低光增强客观评测（合成暗图，`scripts/eval_lowlight.py`）：**SCI-medium 22.1dB / SSIM 0.860** vs 启发式 14.4dB / 0.753 vs 不增强 6.7dB / 0.466。
+实时预览在流畅优先模式下按 960×540 处理。此分辨率上，人脸 + RVM 的推理入口预热后顺序约 12ms/帧，CUDA stream 并发约 9ms/帧（本机三轮各 30 帧，范围 8.6～9.7ms）；单独美颜没有第二个模型可并发。效果链仍按顺序执行；9×9 磨皮滤波切块会增加调度开销，因此保持整图计算。
 
-## 二期计划收尾状态
+推理分解（GPU 时钟拉频口径，`scripts/bench.py`）：
 
-v2 定位为**多效果实时相机系统**，详见 [docs/PLAN.md](docs/PLAN.md) 与 [TODO.md](TODO.md)：
+| 推理项 | ms/帧 |
+|---|---|
+| FaceMesh（检测+关键点+blendshapes，跟踪态） | ~26 |
+| Hands（palm+landmarks） | ~35 |
+| 分割 RVM（mobilenetv3，含时域状态） | ~22 |
+| 深度 Depth Anything V2 Small（392 推理域） | ~25 |
+| 低光 SCI（512 域） | 默认 ONNX CPU 3.6；torch CUDA 实验路径 2.3 |
+| 低光 Retinexformer（512 域，质量档） | ~67（隔帧推理摊薄到 ~34） |
 
-- ~~**自动 HDR 拍照**（P1）~~：**已完成**（gamma 模拟包围曝光 + ECC 对齐 + Mertens + tonemap + 连拍存档）
-- ~~**低光增强**（P2）~~：**已完成**（SCI ONNX 定版，CoreML EP，双引擎可切）
-- ~~**人像虚化 / 背景替换**（P3）~~：**已完成**（三档模式 + 边缘精修 + 程序化背景图库）；进阶档深度渐进虚化（P3-4，Depth Anything V2）未做
-- ~~**换脸（演示级）**（P4）~~：**已完成**（Delaunay + 泊松融合 + 过程可视化 + `--consent` 伦理门）；P4-3 实时版为可选项未做
-- **GPU 加速与评测**（P5）：CoreML EP 已启用并验证（SCI 4.3 倍）、性能基准脚本（`bench.py`）与低光客观评测（`eval_lowlight.py`）就绪；主观问卷与 PPT 由小组线下完成
+组合链（整链均摊，含推理）：
+
+| 链路 | ms/帧 | fps |
+|---|---|---|
+| 美颜 | ~60 | 16.7 |
+| 美颜 + RVM 虚化 | ~96 | 10.4 |
+| 美颜 + RVM 虚化 + 深度渐进虚化 | ~196 | 5.1（质量全开档） |
+
+> 首帧另有 ~15s 冷启动（TorchScript/transformers 加载）；mediapipe 回退路径的基线见 git 历史（M4 口径）。
+
+低光增强客观评测（合成暗图，`scripts/eval_lowlight.py`）：SCI-medium 22.1dB / SSIM 0.860 vs 启发式 14.4dB / 0.753；Retinexformer 为 LOL-v1 SOTA 口径（25.16dB，论文值）。
+
+## 版本历史
+
+- **v3（2026-09-23）**：Windows + CUDA 迁移；推理全 GPU（TorchScript）；RVM 分割、Retinexformer 低光、Depth Anything V2 深度虚化三项模型升级/新增；同帧独立模型 CUDA stream 并发；220 单测。
+- **v2（2026-09）**：core/gui 分层 + PySide6 + 效果链插件；HDR / SCI 低光 / 虚拟背景 / 换脸 / 自适应画质；183 单测（macOS arm64 口径，详见 git 历史）。
+- **v1**：Tkinter 单文件版（`legacy/`）。
 
 > 硬件部分（STM32F103 + LED 指示灯联动）的代码不在本仓库，PPT 中的相关内容为另一条交付线。

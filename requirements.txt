@@ -1,11 +1,31 @@
-# 顶层依赖（版本经 2026-09 本机（macOS darwin 27 / Apple M4）实测锁定）
-# mediapipe 必须 0.10.x：1.0.x 移除 mp.solutions 且 Tasks 检测类图在本机
-# Metal 服务上硬崩溃（P0-1 冒烟结论，详见 core/infer.py 模块头注释）
+# 顶层依赖（版本经 2026-09 本机（Windows 11 / RTX 3060 Laptop / CUDA 12.6）实测锁定）
+#
+# ===== CUDA 迁移（BEAUTYCAM 部署，2026-09）=====
+# torch / torchvision 必须装 CUDA 轮子（CUDA 12.6 口径）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# 推理链全面 PyTorch 化：MediaPipe tflite → TorchScript（scripts/convert_models.py，
+# 转换器 scripts/tflite_to_torch.py）+ RVM / Retinexformer / Depth Anything V2。
+# CUDA 不可用或 TorchScript 未转换时自动回退 MediaPipe CPU / ONNX Runtime 路径。
+torch==2.14.0+cu126
+torchvision==0.29.0+cu126
+
+# 分割升级：RVM（RobustVideoMatting 官方 TorchScript，torch 后端默认分割模型）
+# 深度（P3-4）：Depth Anything V2 Small（HuggingFace transformers 本地权重）
+transformers==5.17.0
+
+# Retinexformer 低光质量档权重经 gdown 从 Google Drive 拉取（download_models.py）
+gdown==6.4.0
+
+# ===== 模型转换工具链（scripts/convert_models.py 一次性转换用）=====
+tflite==2.18.0          # flatbuffer 解析（tflite_to_torch.py 自研转换器）
+onnx==1.22.0            # SCI ONNX 加载（onnx2torch 输入）
+onnx2torch==1.5.15      # SCI ONNX → torch
+
+# ===== MediaPipe 回退后端（torch 后端不可用时；Windows CPU 委托稳定）=====
 mediapipe==0.10.21
 numpy==1.26.4
 opencv-python==4.11.0.86
 PySide6==6.11.2
 pillow==12.3.0
-# Phase 2 低光增强 SCI 的 ONNX 推理（CoreML EP 优先，CPU 回退；
-# 版本联动坑见 AGENTS.md #6——升级 numpy/mediapipe/opencv 前先跑全量单测）
+# SCI 低光快速档的 ONNX 回退推理（CUDA/ CoreML/ CPU EP 优先级见 core/infer.py）
 onnxruntime==1.30.0

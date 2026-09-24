@@ -19,17 +19,25 @@ from .context import FrameContext
 NEED_FACES = "faces"
 NEED_HANDS = "hands"
 NEED_SEGMENTATION = "segmentation"
+NEED_DEPTH = "depth"
 
 
 class Effect(ABC):
     """效果基类：每个效果是 core/effects/ 下一个模块里的一个类。
 
     子类需提供 name、default_params()、process(frame, ctx)。
+    可选 GPU 快路径：supports_gpu=True 且实现 process_gpu(frame_t, ctx)
+    （(1,3,H,W) uint8 BGR 设备张量进出）。Pipeline(use_gpu=True) 时，
+    连续的 GPU 效果共享同一次帧上传/下载（整链常驻显存，见
+    core/effects/_torch_impl.py 模块头）；process_gpu 抛 NotImplementedError
+    时该效果自动回退 CPU 路径（如低光 SCI 的 ONNX 会话）。
     """
 
     name: str = "base"
     # 该效果启用时需要的推理结果，如 {NEED_FACES}
     needs: frozenset[str] = frozenset()
+    # 是否具备 GPU 快路径（类级声明；运行期不可用由 process_gpu 自行回退）
+    supports_gpu = False
 
     def __init__(self, enabled: bool = True, params: Optional[dict] = None):
         self._lock = threading.Lock()
@@ -52,6 +60,15 @@ class Effect(ABC):
     @abstractmethod
     def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
         """处理一帧（BGR），返回处理后的帧。ctx 为本帧共享推理结果。"""
+
+    def process_gpu(self, frame_t, ctx: FrameContext):
+        """GPU 快路径：(1,3,H,W) uint8 BGR 设备张量进出。
+
+        默认不支持（supports_gpu=False 的效果不会被调到这里）；具备快
+        路径但在当前参数/会话下不可用（如低光 SCI 走 ONNX 会话）时抛
+        NotImplementedError，Pipeline 会下载回 CPU 走 process()。
+        """
+        raise NotImplementedError
 
     def inference_interval(self, need: str) -> int:
         """该效果对某类推理的调用间隔（帧数）。1 = 每帧都跑；N = 每 N 帧跑一次。
@@ -102,24 +119,52 @@ class Effect(ABC):
 
 
 class Pipeline:
-    """有序效果链。process 前先由调用方（worker/CLI）统一跑推理填充 ctx。"""
+    """有序效果链。process 前先由调用方（worker/CLI）统一跑推理填充 ctx。
 
-    def __init__(self, effects: list[Effect]):
+    use_gpu=True 时启用效果链 GPU 融合：连续的 supports_gpu 效果在同一次
+    帧上传/下载里直通（frame_t 在效果间以设备张量传递，见 Effect.process_gpu），
+    遇 CPU 效果自动落回 numpy。默认 False（CPU 路径是逐位基准，测试/评测
+    默认走它）。
+    """
+
+    def __init__(self, effects: list[Effect], use_gpu: bool = False):
         self._effects: dict[str, Effect] = {}
         for e in effects:
             if e.name in self._effects:
                 raise ValueError(f"效果重名: {e.name}")
             self._effects[e.name] = e
         self._order: list[str] = [e.name for e in effects]
+        self._use_gpu = bool(use_gpu)
 
     # ------- 帧处理 -------
 
     def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
+        if not self._use_gpu:
+            for name in self._order:
+                e = self._effects[name]
+                if not e.enabled:
+                    continue
+                frame = e.process(frame, ctx)
+            return frame
+        from .gpuops import download_frame, upload_frame
+        pending = None              # 当前帧的 GPU 形态（无则 frame 为准）
         for name in self._order:
             e = self._effects[name]
             if not e.enabled:
                 continue
+            if e.supports_gpu:
+                if pending is None:
+                    pending = upload_frame(frame)
+                try:
+                    pending = e.process_gpu(pending, ctx)
+                    continue
+                except NotImplementedError:
+                    pass             # 该效果当前不可 GPU 化：落回 CPU
+                frame = download_frame(pending)
+                pending = None
             frame = e.process(frame, ctx)
+        if pending is not None:
+            frame = download_frame(pending)
         return frame
 
     # ------- 推理需求聚合 -------

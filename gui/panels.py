@@ -21,14 +21,17 @@ from PySide6.QtWidgets import (
 from core.effects.segment import (
     MODE_BLUR, MODE_COLOR, MODE_IMAGE, list_backgrounds, load_image,
 )
-from core.infer import DEFAULT_SEGMENTER, SEGMENTER_SPECS
+from core.infer import (
+    DEFAULT_SEGMENTER, SEGMENTER_SPECS, TORCH_ONLY_SEGMENTERS, get_engine,
+)
 from core.pipeline import Pipeline
 
-# 低光增强引擎选择（Phase 2：「经典 vs 深度」对比线）
+# 低光增强引擎选择（CUDA 迁移后双深度档：快速 SCI / 质量 Retinexformer）
 LOWLIGHT_CHOICES = [
     ("关闭", "off"),
     ("经典启发式（基线）", "heuristic"),
-    ("SCI 深度模型（推荐）", "sci"),
+    ("SCI 深度模型（快速）", "sci"),
+    ("Retinexformer（高质量·慢）", "retinex"),
 ]
 LOWLIGHT_SCI_LEVELS = [("轻度 easy", "easy"), ("中度 medium", "medium"),
                        ("强力 difficult", "difficult")]
@@ -46,11 +49,25 @@ COLOR_PRESETS = [
     ("绿幕", "#00B140"),
 ]
 
-# 分割模型下拉：(显示名, 模型键)。用于答辩时的"质量 vs 速度"对比
-SEGMENTER_CHOICES = [
-    ("二元·快（13ms）", "selfie_segmenter_binary"),
-    ("多分类·慢（155ms）", "selfie_segmenter"),
-]
+# 分割模型下拉：(显示名, 模型键)。torch 后端多出 RVM 视频抠图（默认，
+# 发丝级 alpha + 时域一致）；mediapipe 后端只有两个 tflite。
+SEGMENTER_LABELS = {
+    "rvm": "RVM 视频抠图·推荐",
+    "selfie_segmenter_binary": "二元·快（13ms）",
+    "selfie_segmenter": "多分类·慢（155ms）",
+}
+
+
+def segmenter_choices() -> list[tuple[str, str]]:
+    """按当前推理后端返回可用分割模型（torch-only 的 RVM 在 mediapipe
+    后端下隐藏，避免选了报错）。"""
+    try:
+        backend = get_engine().backend_name
+    except Exception:   # noqa: BLE001 —— 无模型环境（纯函数单测）退 mediapipe
+        backend = "mediapipe:cpu"
+    keys = [k for k in SEGMENTER_SPECS
+            if backend.startswith("torch") or k not in TORCH_ONLY_SEGMENTERS]
+    return [(SEGMENTER_LABELS.get(k, k), k) for k in keys]
 
 
 class SliderRow(QWidget):
@@ -112,6 +129,12 @@ class BeautyPanel(QGroupBox):
         grid.addWidget(self.chk_eye, 5, 0)
         grid.addWidget(SliderRow("大眼强度", 0.0, 0.5, p["eye_strength"],
                                  self._set("eye_strength")), 5, 1, 1, 2)
+
+        self.chk_finish = QCheckBox("收尾去噪与锐化")
+        self.chk_finish.setChecked(p["finish"])
+        self.chk_finish.setToolTip("默认关闭，避免实时预览出现过锐的边缘和失去皮肤纹理")
+        self.chk_finish.toggled.connect(self._set("finish"))
+        grid.addWidget(self.chk_finish, 6, 0, 1, 3)
 
     def _set(self, key: str):
         return lambda v: self.pipeline.set_params("beauty", **{key: v})
@@ -202,7 +225,9 @@ class LowLightPanel(QGroupBox):
         lay.addWidget(self.cmb_level)
 
         self.row_strength = SliderRow(
-            "增强强度", 0.0, 1.0, 1.0, self._set_strength)
+            "增强强度", 0.0, 1.0,
+            pipeline.get_effect("lowlight").get_params()["strength"],
+            self._set_strength)
         lay.addWidget(self.row_strength)
 
         self.chk_auto = QCheckBox("仅暗光时自动增强（灰度均值 < 60）")
@@ -216,8 +241,11 @@ class LowLightPanel(QGroupBox):
 
     def _engine_changed(self, *_) -> None:
         mode = self.cmb_engine.currentData()
+        dnn_on = mode in ("sci", "retinex")
+        if dnn_on:   # 切引擎前先落参数（低光链首帧创建会话时读到）
+            self.pipeline.set_params("lowlight_dnn", engine=mode)
         self.pipeline.set_enabled("lowlight", mode == "heuristic")
-        self.pipeline.set_enabled("lowlight_dnn", mode == "sci")
+        self.pipeline.set_enabled("lowlight_dnn", dnn_on)
         sci = mode == "sci"
         self.lbl_level.setVisible(sci)
         self.cmb_level.setVisible(sci)
@@ -372,10 +400,13 @@ class SegmentPanel(QGroupBox):
         mrow = QHBoxLayout()
         mrow.addWidget(QLabel("分割模型"))
         self.cmb_model = QComboBox()
-        for label, value in SEGMENTER_CHOICES:
+        for label, value in segmenter_choices():
             self.cmb_model.addItem(label, value)
+        # 默认跟随引擎（torch 后端默认 rvm；查不到就退 DEFAULT_SEGMENTER）
+        engine_default = getattr(get_engine(), "segmenter_model",
+                                 DEFAULT_SEGMENTER)
         self.cmb_model.setCurrentIndex(
-            max(0, self.cmb_model.findData(DEFAULT_SEGMENTER)))
+            max(0, self.cmb_model.findData(engine_default)))
         self.cmb_model.currentIndexChanged.connect(self._model_changed)
         mrow.addWidget(self.cmb_model)
         lay.addLayout(mrow)
@@ -444,6 +475,43 @@ class SegmentPanel(QGroupBox):
             self._on_model_change(key)
 
 
+class BokehPanel(QGroupBox):
+    """深度渐进虚化（P3-4，CUDA 迁移补上）：近清远糊，焦平面对齐人物。
+
+    需要 torch 后端 + Depth Anything V2 权重；mediapipe 后端下效果自动
+    透传（core/effects/bokeh.py 告警一次）。与"人像虚化"的均匀模糊互补：
+    这里的模糊量随深度连续变化，观感对齐单反镜头。
+    """
+
+    def __init__(self, pipeline: Pipeline, parent=None):
+        super().__init__("深度渐进虚化（单反感）", parent)
+        self.pipeline = pipeline
+        effect = pipeline.get_effect("bokeh")
+        p = effect.get_params()
+
+        lay = QVBoxLayout(self)
+        self.chk_enabled = QCheckBox("启用")
+        self.chk_enabled.setChecked(effect.enabled)
+        self.chk_enabled.toggled.connect(
+            lambda on: pipeline.set_enabled("bokeh", on))
+        lay.addWidget(self.chk_enabled)
+
+        self.row_strength = SliderRow(
+            "虚化强度", 0.0, 1.0, p["strength"],
+            lambda v: pipeline.set_params("bokeh", strength=v))
+        lay.addWidget(self.row_strength)
+        self.row_range = SliderRow(
+            "焦外范围", 0.1, 0.8, p["range"],
+            lambda v: pipeline.set_params("bokeh", range=v))
+        lay.addWidget(self.row_range)
+
+        self.chk_matte = QCheckBox("人像保持清晰（需分割模型）")
+        self.chk_matte.setChecked(p["use_matte"])
+        self.chk_matte.toggled.connect(
+            lambda on: pipeline.set_params("bokeh", use_matte=on))
+        lay.addWidget(self.chk_matte)
+
+
 class CapturePanel(QGroupBox):
     """拍照：手动按钮 + V 手势 / 笑脸自动触发。"""
 
@@ -454,11 +522,21 @@ class CapturePanel(QGroupBox):
         self.btn_capture.setEnabled(False)
         self.btn_capture.clicked.connect(on_manual)
         self.chk_vsign = QCheckBox("V 手势自动拍照（持续 1s）")
-        self.chk_vsign.setChecked(True)
+        self.chk_vsign.setChecked(False)
+        self.chk_vsign.setToolTip("开启后每帧运行手部检测，会降低预览帧率")
         self.chk_smile = QCheckBox("笑脸自动拍照（持续 0.5s）")
-        self.chk_smile.setChecked(True)
-        for w in (self.btn_capture, self.chk_vsign, self.chk_smile):
+        self.chk_smile.setChecked(False)
+        self.chk_smile.setToolTip("开启后每帧计算表情置信度，会降低预览帧率")
+        # 流畅优先：预览链在 540p 处理（像素域开销 ~½²），拍照自动回到
+        # 原始分辨率出片。全开效果时建议开启；追求逐像素画质可关闭。
+        self.chk_smooth = QCheckBox("流畅优先（预览 540p 处理，拍照全分辨率）")
+        self.chk_smooth.setChecked(True)
+        for w in (self.btn_capture, self.chk_vsign, self.chk_smile,
+                  self.chk_smooth):
             v.addWidget(w)
+
+    def smooth_mode(self) -> bool:
+        return self.chk_smooth.isChecked()
 
     def triggers(self) -> set[str]:
         from gui.workers import TRIGGER_SMILE, TRIGGER_V_SIGN

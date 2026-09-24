@@ -81,8 +81,10 @@ class TestSciEffect(unittest.TestCase):
         self.assertTrue(eff.is_dark)
         bright = bright_frame()
         self.assertIs(eff.process(bright, FrameContext()), bright)
-        self.assertIn(eff.provider, ("CoreMLExecutionProvider",
-                                     "CPUExecutionProvider"))
+        # 会话后端：torch（CUDA 迁移后默认）或 ONNX（CoreML/CPU 回退）
+        self.assertTrue(eff.provider.startswith(("PyTorch-", "CUDA",
+                                                 "CoreML", "CPU")),
+                        f"意外的 provider：{eff.provider}")
 
     def test_interval_reuse_same_shape(self):
         """隔帧推理：中间帧复用上一帧结果，输出形状保持原帧尺寸。"""

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from typing import Optional
@@ -16,27 +17,37 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QApplication, QComboBox, QDialog, QFileDialog, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton, QScrollArea,
     QVBoxLayout, QWidget,
 )
 
 from core.camera import LiveCamera, VideoFileSource
 from core.effects.autoenhance import AutoEnhanceEffect
 from core.effects.beauty import BeautyEffect
+from core.effects.bokeh import BokehEffect
 from core.effects.lowlight import LowLightDnnEffect, LowLightEffect
 from core.effects.segment import SegmentEffect
 from core.infer import SEGMENTER_INTERVAL, get_engine
 from core.pipeline import Pipeline
 from gui.panels import (
-    AutoEnhancePanel, BeautyPanel, CapturePanel, HdrPanel, LowLightPanel,
-    SegmentPanel,
+    AutoEnhancePanel, BeautyPanel, BokehPanel, CapturePanel, HdrPanel,
+    LowLightPanel, SegmentPanel,
 )
 from gui.workers import CameraWorker, DISPLAY_SIZE, PHOTOS_DIR
 
 RECENT_PHOTOS = 4          # 预览条缩略图数量（一期口径）
 THUMB_SIZE = (152, 100)    # 缩略图尺寸
 VIDEO_VIEW = DISPLAY_SIZE  # 视频显示区逻辑尺寸（与 worker 预缩放一致）
+
+
+def _gpu_pipeline_ready() -> bool:
+    """效果链 GPU 融合可用性（CUDA 在场即开；引擎/效果侧各自还会回退）。"""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
 
 
 def ndarray_to_pixmap(frame_bgr: np.ndarray, size: tuple[int, int]) -> QPixmap:
@@ -88,15 +99,23 @@ class MainWindow(QMainWindow):
         self.resize(1360, 800)
 
         # 管线：自适应画质（链首，先校正曝光/色调，低光的暗光判定看到的是
-        # 校正后的亮度）→ 低光（启发式/SCI 互斥，默认都关）→ 美颜 → 虚化/替换。
+        # 校正后的亮度）→ 低光（启发式/SCI/Retinexformer 互斥，默认都关）
+        # → 美颜 → 虚化/替换 → 深度渐进虚化（高级档，默认关）。
         # 顺序对齐 PLAN §3.2；HDR 是拍照模式不进链（gui/workers.py 连拍）。
         self.pipeline = Pipeline([
-            AutoEnhanceEffect(enabled=False),
-            LowLightEffect(enabled=False),
-            LowLightDnnEffect(enabled=False),
-            BeautyEffect(enabled=True),
+            AutoEnhanceEffect(enabled=False, params={
+                "strength": 0.55, "contrast": 0.15,
+            }),
+            LowLightEffect(enabled=False, params={"strength": 0.6}),
+            LowLightDnnEffect(enabled=False, params={"strength": 0.6}),
+            # 摄像头默认采用轻量、自然的美颜；更强的效果由用户在滑杆上调。
+            BeautyEffect(enabled=True, params={
+                "smooth": 0.25, "whiten": 8.0, "slim": 0.20,
+                "finish": False,
+            }),
             SegmentEffect(enabled=False),
-        ])
+            BokehEffect(enabled=False),
+        ], use_gpu=_gpu_pipeline_ready())
         self.engine = get_engine()
         self.worker: Optional[CameraWorker] = None
         self._last_faces = 0
@@ -177,17 +196,24 @@ class MainWindow(QMainWindow):
         # ---- 采集源 ----
         src_box = QGroupBox("采集源")
         src_lay = QGridLayout(src_box)
-        self.cam_index = QSpinBox()
-        self.cam_index.setRange(0, 9)
+        # 摄像头：扫描按钮 + 设备下拉（扫描是阻塞操作，点按钮触发；
+        # 未扫描前下拉只有"#0"，兼容旧手填习惯——可编辑输入任意索引）
+        self.cam_index = QComboBox()
+        self.cam_index.setEditable(True)
+        self.cam_index.addItem("摄像头 #0")
+        self.cam_index.setCurrentText("0")
+        btn_scan = QPushButton("🔄 扫描摄像头")
+        btn_scan.clicked.connect(self._scan_cameras)
         src_lay.addWidget(QLabel("摄像头"), 0, 0)
         src_lay.addWidget(self.cam_index, 0, 1)
+        src_lay.addWidget(btn_scan, 0, 2)
         btn_video = QPushButton("选择视频文件…")
         btn_video.clicked.connect(self._pick_video)
-        src_lay.addWidget(btn_video, 1, 0, 1, 2)
+        src_lay.addWidget(btn_video, 1, 0, 1, 3)
         self.btn_toggle = QPushButton("开始")
         self.btn_toggle.setObjectName("primaryBtn")
         self.btn_toggle.clicked.connect(self._toggle_camera)
-        src_lay.addWidget(self.btn_toggle, 2, 0, 1, 2)
+        src_lay.addWidget(self.btn_toggle, 2, 0, 1, 3)
         self.selected_video: Optional[str] = None
         lay.addWidget(src_box)
 
@@ -199,6 +225,8 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lowlight_panel)
         self.segment_panel = SegmentPanel(self.pipeline, self._on_model_change)
         lay.addWidget(self.segment_panel)
+        self.bokeh_panel = BokehPanel(self.pipeline)
+        lay.addWidget(self.bokeh_panel)
         self.hdr_panel = HdrPanel(self._hdr_capture)
         lay.addWidget(self.hdr_panel)
         self.capture_panel = CapturePanel(self._manual_capture)
@@ -212,6 +240,34 @@ class MainWindow(QMainWindow):
 
     # ---------------- 相机控制 ----------------
 
+    def current_camera_index(self) -> int:
+        """下拉当前选择的摄像头索引（可编辑框允许手填任意索引）。"""
+        text = self.cam_index.currentText()
+        m = re.search(r"\d+", text)
+        return int(m.group()) if m else 0
+
+    def _scan_cameras(self) -> None:
+        """扫描可用摄像头填充下拉（阻塞 ~1-3s，状态栏提示进度）。"""
+        from core.camera import scan_cameras
+        self.statusBar().showMessage("正在扫描摄像头（约 1-3 秒）…")
+        QApplication.processEvents()
+        cams = scan_cameras()
+        self.cam_index.clear()
+        if not cams:
+            self.cam_index.addItem("摄像头 #0")
+            self.cam_index.setCurrentText("0")
+            self.statusBar().showMessage(
+                "未扫描到可用摄像头——检查连接/占用，或直接手填索引后开始")
+            return
+        for c in cams:
+            label = f"摄像头 #{c['index']}"
+            if c["width"]:
+                label += f"（{c['width']}×{c['height']}）"
+            self.cam_index.addItem(label)
+        self.statusBar().showMessage(
+            f"扫描到 {len(cams)} 个摄像头："
+            + "、".join(f"#{c['index']}" for c in cams))
+
     def _toggle_camera(self) -> None:
         if self.worker is not None and self.worker.isRunning():
             self._stop_worker()
@@ -219,11 +275,13 @@ class MainWindow(QMainWindow):
         if self.selected_video:
             source = VideoFileSource(self.selected_video)
         else:
-            source = LiveCamera(index=self.cam_index.value(), mirror=True)
+            source = LiveCamera(index=self.current_camera_index(),
+                                mirror=True)
         # 一期双线程 bug 根治：单 worker 实例，先建后启动
         self.worker = CameraWorker(
             source, self.pipeline, self.engine,
-            triggers=self.capture_panel.triggers())
+            triggers=self.capture_panel.triggers(),
+            process_scale=0.75 if self.capture_panel.smooth_mode() else 1.0)
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.photo_saved.connect(self._on_photo_saved)
         self.worker.fps_changed.connect(self._on_fps)
@@ -318,8 +376,14 @@ class MainWindow(QMainWindow):
             PhotoDialog(self._recent_paths[idx], self).exec()
 
     def _open_album(self) -> None:
+        """打开相册目录（平台差异：macOS 用 open，Windows 用 os.startfile）。"""
         os.makedirs(PHOTOS_DIR, exist_ok=True)
-        subprocess.Popen(["open", PHOTOS_DIR])
+        if sys.platform == "win32":
+            os.startfile(PHOTOS_DIR)   # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", PHOTOS_DIR])
+        else:
+            subprocess.Popen(["xdg-open", PHOTOS_DIR])
 
     # ---------------- 其他 ----------------
 

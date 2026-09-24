@@ -42,15 +42,17 @@ from core.camera import ImageSequenceSource, VideoFileSource  # noqa: E402
 from core.context import FrameContext                          # noqa: E402
 from core.effects.autoenhance import AutoEnhanceEffect         # noqa: E402
 from core.effects.beauty import BeautyEffect                   # noqa: E402
+from core.effects.bokeh import BokehEffect                     # noqa: E402
 from core.effects.lowlight import LowLightDnnEffect, LowLightEffect  # noqa: E402
 from core.effects.segment import (                              # noqa: E402
     MODE_BLUR, MODE_COLOR, MODE_IMAGE, SegmentEffect,
 )
 from core.infer import (                                        # noqa: E402
-    DEFAULT_SEGMENTER, SEGMENTER_INTERVAL, SEGMENTER_SPECS, get_engine,
+    DEFAULT_SEGMENTER, SEGMENTER_INTERVAL, SEGMENTER_SPECS,
+    TORCH_ONLY_SEGMENTERS, get_engine, torch_backend_ready,
 )
 from core.pipeline import (                                     # noqa: E402
-    NEED_FACES, NEED_HANDS, NEED_SEGMENTATION, Pipeline,
+    NEED_FACES, NEED_HANDS, NEED_SEGMENTATION, NEED_DEPTH, Pipeline,
 )
 
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv")
@@ -178,7 +180,11 @@ def main() -> int:
     ap.add_argument("--eye", type=float, default=0.0, help="大眼强度 0~0.5（0=关）")
     ap.add_argument("--lowlight", action="store_true", help="启用启发式低光增强")
     ap.add_argument("--lowlight-dnn", action="store_true",
-                    help="启用 SCI 深度低光增强（Phase 2 主力档，覆盖 --lowlight）")
+                    help="启用深度低光增强（SCI 快速档，覆盖 --lowlight）")
+    ap.add_argument("--lowlight-engine", choices=("sci", "retinex"),
+                    default="sci",
+                    help="深度低光引擎：SCI 快速档 / Retinexformer 质量档"
+                         "（LOL-v1 SOTA，需 GPU，仅 --lowlight-dnn）")
     ap.add_argument("--lowlight-level", choices=("easy", "medium", "difficult"),
                     default="medium", help="SCI 强度档（仅 --lowlight-dnn）")
     ap.add_argument("--lowlight-strength", type=float, default=1.0,
@@ -225,11 +231,24 @@ def main() -> int:
     seg.add_argument("--seg-interval", type=int, default=0,
                      help="分割推理间隔帧数；0=跟随所选模型（二元 1 / 多分类 4）")
     seg.add_argument("--seg-model", choices=tuple(SEGMENTER_SPECS),
-                     default=DEFAULT_SEGMENTER, help="分割模型")
+                     default=None,
+                     help="分割模型；缺省跟随引擎（torch 后端=RVM 视频抠图，"
+                          "mediapipe=二元）")
     seg.add_argument("--seg-compare", action="store_true",
                      help="另出边缘处理四档对比图（答辩素材）")
     seg.add_argument("--seg-dump-alpha", action="store_true",
                      help="另存 alpha 灰度图（人应是白的；用于排查掩膜反转）")
+    # ---- 深度渐进虚化（P3-4，torch 后端 + Depth Anything V2） ----
+    bk = ap.add_argument_group("深度渐进虚化")
+    bk.add_argument("--bokeh", action="store_true",
+                    help="启用深度渐进虚化（近清远糊，焦平面对齐人物）")
+    bk.add_argument("--bokeh-strength", type=float, default=0.7,
+                    help="虚化强度 0~1")
+    bk.add_argument("--bokeh-range", type=float, default=0.35,
+                    help="焦外深度范围（越小过渡越陡）")
+    bk.add_argument("--bokeh-no-matte", dest="bokeh_matte",
+                    action="store_false", default=True,
+                    help="不用人像掩膜锁定人物清晰")
     args = ap.parse_args()
 
     source = build_source(args.input)
@@ -252,6 +271,7 @@ def main() -> int:
         lowlight = LowLightDnnEffect(
             enabled=not args.raw,
             params={"level": args.lowlight_level,
+                    "engine": args.lowlight_engine,
                     "strength": args.lowlight_strength,
                     "auto": not args.lowlight_force})
     else:
@@ -260,8 +280,10 @@ def main() -> int:
             params={"strength": args.lowlight_strength,
                     "auto": not args.lowlight_force})
     bg_path = os.path.abspath(args.seg_bg) if args.seg_bg else ""
-    # 间隔默认跟随模型：二元 13ms 可每帧跑，多分类 155ms 必须隔帧
-    seg_interval = args.seg_interval or SEGMENTER_INTERVAL[args.seg_model]
+    # 间隔默认跟随模型（二元/RVM=1 每帧，多分类=4 隔帧）；--seg-model 缺省
+    # 时按引擎默认模型（torch=RVM → 1）取值
+    seg_interval = args.seg_interval or SEGMENTER_INTERVAL.get(
+        args.seg_model, 1)
     segment = SegmentEffect(enabled=args.segment and not args.raw, params={
         "mode": args.seg_mode, "strength": args.seg_strength,
         "bg_path": bg_path, "bg_color": args.seg_bg_color,
@@ -269,13 +291,27 @@ def main() -> int:
         "feather": args.seg_feather, "smooth": args.seg_smooth,
         "infer_interval": seg_interval,
     })
-    pipeline = Pipeline([autoenhance, lowlight, beauty, segment])
+    bokeh = BokehEffect(enabled=args.bokeh and not args.raw, params={
+        "strength": args.bokeh_strength, "range": args.bokeh_range,
+        "use_matte": args.bokeh_matte})
+    # torch 后端时启用效果链 GPU 融合（与 GUI 同口径；批跑提速同一套）
+    pipeline = Pipeline([autoenhance, lowlight, beauty, segment, bokeh],
+                        use_gpu=torch_backend_ready() and not args.raw)
 
     if args.raw:
         engine = None
     else:
         engine = get_engine()
-        engine.set_segmenter_model(args.seg_model)
+        # 缺省跟随引擎默认（torch=RVM / mediapipe=二元）；
+        # mediapipe 后端无法执行 torch-only 的 RVM：自动退回二元模型
+        seg_model = args.seg_model or getattr(engine, "segmenter_model",
+                                              DEFAULT_SEGMENTER)
+        if seg_model in TORCH_ONLY_SEGMENTERS \
+                and not torch_backend_ready():
+            print(f"[提示] 当前后端不支持 {seg_model}，退回 "
+                  f"{DEFAULT_SEGMENTER}")
+            seg_model = DEFAULT_SEGMENTER
+        engine.set_segmenter_model(seg_model)
 
     if not source.open():
         print(f"无法打开输入：{source.name}", file=sys.stderr)
@@ -311,15 +347,21 @@ def main() -> int:
         if isinstance(source, ImageSequenceSource):
             # 每张图互相独立：不继承上一张的掩膜/背景缓存（否则串帧）
             pipeline.reset_temporal()
+            if engine is not None and hasattr(engine, "reset_temporal"):
+                engine.reset_temporal()   # RVM 循环状态同样断开
 
         ctx = None
         if engine is not None:
             t0 = time.perf_counter()
-            needs = pipeline.infer_needs_for(n)
+            # 图片序列：逐张已 reset_temporal，帧序恒 0 保证首帧全量推理
+            # （否则深度隔帧间隔会让独立图片拿不到 depth）
+            needs = pipeline.infer_needs_for(
+                0 if isinstance(source, ImageSequenceSource) else n)
             ctx = engine.process(
                 frame,
                 faces=NEED_FACES in needs, hands=NEED_HANDS in needs,
-                segmentation=NEED_SEGMENTATION in needs)
+                segmentation=NEED_SEGMENTATION in needs,
+                depth=NEED_DEPTH in needs)
             t_infer += time.perf_counter() - t0
             t0 = time.perf_counter()
             frame = pipeline.process(frame, ctx)
@@ -352,7 +394,7 @@ def main() -> int:
     if engine is not None:
         print(f"  推理累计 {t_infer:.2f}s，效果链累计 {t_effect:.2f}s，"
               f"均摊 {(t_infer + t_effect) / max(n, 1) * 1000:.1f} ms/帧")
-        print(f"  分割模型：{engine.segmenter_model}"
+        print(f"  推理后端 {engine.backend_name}，分割模型 {engine.segmenter_model}"
               f"（建议推理间隔 {engine.recommended_interval} 帧）")
     print(f"输出目录：{out_dir.resolve()}")
     return 0

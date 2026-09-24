@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import glob
 import os
+import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
@@ -69,6 +71,48 @@ class CameraSource(ABC):
         self.release()
 
 
+def _camera_backend() -> int:
+    """按平台选 OpenCV 采集后端。
+
+    Windows 用 CAP_DSHOW（比默认 MSMF 打开快、枚举稳）；macOS 显式
+    AVFoundation（误选其他后端会打不开，见 LiveCamera 类注释）；
+    其余平台走 OpenCV 默认。
+    """
+    if sys.platform == "win32" and hasattr(cv2, "CAP_DSHOW"):
+        return cv2.CAP_DSHOW
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    return cv2.CAP_ANY
+
+
+def scan_cameras(max_index: int = 4, warmup_reads: int = 2) -> list[dict]:
+    """扫描本机可用摄像头，返回按索引升序的设备列表。
+
+    每项：{"index": int, "width": int, "height": int}。逐个打开 + 试读
+    一帧判定可用（isOpened 为 True 但出不了帧的虚拟设备会被过滤掉）。
+    扫描是阻塞操作（每设备 open ~0.3-1s），GUI 里由按钮触发，不要在
+    启动时自动全扫。max_index=4 已覆盖内置 + 外接的常见形态。
+    """
+    found: list[dict] = []
+    for idx in range(max_index + 1):
+        cap = cv2.VideoCapture(idx, _camera_backend())
+        ok = cap.isOpened()
+        w = h = 0
+        if ok:
+            got = False
+            for _ in range(warmup_reads):
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    h, w = frame.shape[:2]
+                    got = True
+                    break
+            ok = got
+        cap.release()
+        if ok:
+            found.append({"index": idx, "width": int(w), "height": int(h)})
+    return found
+
+
 class LiveCamera(CameraSource):
     """实时摄像头。固定 1280×720，默认镜像（自拍语义）。
 
@@ -77,12 +121,14 @@ class LiveCamera(CameraSource):
         stderr 出现 "not authorized to capture video"（打开失败的主因）；
       - 授权后首次 open 也可能初始化不完全，需要重试几次；
       - 前几帧常为空（AVFoundation 会话启动中），read() 需预热。
+    Windows：后端走 DSHOW（见 _camera_backend），打开/枚举比 MSMF 稳。
     """
 
     # open() 失败后的重试次数与间隔（授权弹窗确认存在竞态窗口）
     OPEN_RETRIES = 3
     OPEN_RETRY_DELAY = 0.8
     WARMUP_READS = 5          # open 后预读帧数（丢掉启动空帧）
+    READ_WAIT_S = 0.3         # 采集线程暂时无帧时，消费端单次等待上限
     continuous = True          # 实时源：偶发空帧重试而非结束
 
     def __init__(self, index: int = 0, mirror: bool = True,
@@ -92,48 +138,92 @@ class LiveCamera(CameraSource):
         self.width = width
         self.height = height
         self._cap: Optional[cv2.VideoCapture] = None
+        self._capture_thread: Optional[threading.Thread] = None
+        self._capture_stop = threading.Event()
+        self._frame_ready = threading.Condition()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_seq = 0
+        self._read_seq = 0
         self.last_error: str = ""
 
     def open(self) -> bool:
+        backend = _camera_backend()
         for attempt in range(self.OPEN_RETRIES):
-            # AVFoundation 后端显式指定，避免 OpenCV 误选其他后端
-            cap = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+            cap = cv2.VideoCapture(self.index, backend)
             if not cap.isOpened():
                 cap.release()
                 self.last_error = (
                     f"摄像头#{self.index} 打不开（第 {attempt + 1} 次）。"
-                    "最常见原因是 macOS 未授权：系统设置 → 隐私与安全性 → 摄像头，"
-                    "勾选运行 Python 的终端应用（Terminal/iTerm/VS Code 等）后重试。")
+                    "Windows 常见原因：设备被占用或索引不对（点「扫描摄像头」"
+                    "看可用列表）；macOS 常见原因：未授权（系统设置 → 隐私与"
+                    "安全性 → 摄像头，勾选运行 Python 的终端应用后重试）。")
                 time.sleep(self.OPEN_RETRY_DELAY)
                 continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            # 预热：AVFoundation 会话启动中前几帧为空
+            # 后端支持时限制驱动缓冲，防止处理慢时排队旧帧；不支持则由下方
+            # 独立采集线程持续读取并覆盖旧帧。
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # 预热：会话启动中前几帧为空
+            first_frame = None
             for _ in range(self.WARMUP_READS):
-                ret, _ = cap.read()
+                ret, first_frame = cap.read()
                 if ret:
                     break
                 time.sleep(0.1)
             self._cap = cap
+            with self._frame_ready:
+                self._latest_frame = first_frame if ret else None
+                self._latest_seq = 1 if ret else 0
+                self._read_seq = 0
+            self._capture_stop.clear()
+            self._capture_thread = threading.Thread(
+                target=self._capture_loop, args=(cap,), daemon=True,
+                name=f"BeautyCam-摄像头{self.index}")
+            self._capture_thread.start()
             self.last_error = ""
             return True
         return False
 
+    def _capture_loop(self, cap: cv2.VideoCapture) -> None:
+        """始终读取设备新帧，消费端只领取最新一张。"""
+        while not self._capture_stop.is_set():
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+            with self._frame_ready:
+                self._latest_frame = frame
+                self._latest_seq += 1
+                self._frame_ready.notify_all()
+
     def read(self) -> tuple[bool, Optional[np.ndarray]]:
         if self._cap is None:
             return False, None
-        ret, frame = self._cap.read()
-        if not ret or frame is None:
-            # 偶发空帧（自动对焦/曝光切换）不视为致命，交由上层重试
-            return False, None
+        with self._frame_ready:
+            fresh = self._frame_ready.wait_for(
+                lambda: self._latest_seq > self._read_seq
+                or self._capture_stop.is_set(), timeout=self.READ_WAIT_S)
+            if not fresh or self._latest_seq <= self._read_seq:
+                return False, None
+            frame = self._latest_frame
+            self._read_seq = self._latest_seq
         if self.mirror:
             frame = cv2.flip(frame, 1)
         return True, frame
 
     def release(self) -> None:
         if self._cap is not None:
+            self._capture_stop.set()
+            with self._frame_ready:
+                self._frame_ready.notify_all()
+            if self._capture_thread is not None:
+                self._capture_thread.join(timeout=1.0)
+                self._capture_thread = None
             self._cap.release()
             self._cap = None
+            with self._frame_ready:
+                self._latest_frame = None
 
     @property
     def name(self) -> str:

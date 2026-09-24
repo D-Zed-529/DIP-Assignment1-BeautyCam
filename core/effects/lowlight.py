@@ -41,6 +41,7 @@ class LowLightEffect(Effect):
     """
 
     name = "lowlight"
+    supports_gpu = True          # 张量快路径见 _torch_impl.lowlight_heuristic_t
 
     @staticmethod
     def default_params() -> dict:
@@ -49,6 +50,13 @@ class LowLightEffect(Effect):
             "threshold": LOW_LIGHT_THRESHOLD,
             "strength": 1.0,
         }
+
+    def process_gpu(self, frame_t, ctx: FrameContext):
+        from ._torch_impl import lowlight_heuristic_t
+        out = [False]
+        t = lowlight_heuristic_t(frame_t, self._p(), out)
+        self._last_dark = out[0]
+        return t
 
     @property
     def is_dark(self) -> bool:
@@ -76,18 +84,23 @@ class LowLightEffect(Effect):
 
 
 class LowLightDnnEffect(Effect):
-    """SCI 深度弱光增强（Phase 2 主力档）。
+    """深度弱光增强（双引擎：SCI 快速档 / Retinexformer 质量档）。
 
     参数：
       auto:          True 时仅当整帧亮度低于阈值才增强（默认）
       threshold:     自动触发的亮度阈值（与启发式同口径）
       strength:      增强强度 0~1（增强结果与原图混合）
-      level:         SCI 强度档 easy / medium / difficult（换模型文件）
+      level:         SCI 强度档 easy / medium / difficult（换模型文件，
+                     仅 engine=sci 时有意义）
+      engine:        sci（CVPR 2022，54KB，快速档）/ retinex（ICCV 2023，
+                     LOL-v1 25.16dB，质量档；CUDA 部署后算力富余的升级项）
       infer_interval: 推理间隔帧数（默认 2：隔帧推理 + 复用上一帧结果）
     """
 
     name = "lowlight_dnn"
     needs = frozenset()          # 不依赖 MediaPipe 推理结果
+    supports_gpu = True          # 会话有张量接口时走 GPU（否则自动回退 CPU）
+    ENGINES = ("sci", "retinex")
 
     @staticmethod
     def default_params() -> dict:
@@ -96,6 +109,7 @@ class LowLightDnnEffect(Effect):
             "threshold": LOW_LIGHT_THRESHOLD,
             "strength": 1.0,
             "level": LOWLIGHT_DEFAULT_LEVEL,
+            "engine": "sci",
             "infer_interval": 2,
         }
 
@@ -103,12 +117,28 @@ class LowLightDnnEffect(Effect):
         super().__init__(*args, **kwargs)
         if self._params["level"] not in LOWLIGHT_LEVELS:
             raise ValueError(f"未知 SCI 强度档：{self._params['level']}")
+        if self._params["engine"] not in self.ENGINES:
+            raise ValueError(f"未知低光引擎：{self._params['engine']}")
         self._last_dark = False
         self._frame_seen = 0
         self._session = None       # 懒加载（缺权重时降级透传并告警一次）
-        self._session_level: str | None = None
+        self._session_key: tuple[str, str] | None = None
         self._warned = False
         self._last_enhanced: np.ndarray | None = None   # 隔帧复用（原尺寸 BGR）
+        # GPU 快路径的跨帧状态（张量域，与 CPU 侧独立）
+        self._out_state: dict = {"last_dark": False,
+                                 "last_enhanced_t": None, "frame_seen": 0}
+
+    def process_gpu(self, frame_t, ctx: FrameContext):
+        """GPU 快路径：会话缺张量接口（ONNX 会话）时抛 NotImplementedError，
+        Pipeline 落回 CPU process()。"""
+        from ._torch_impl import lowlight_dnn_blend_t
+        session = self._get_session()
+        if session is None:
+            return frame_t          # 缺权重：透传（CPU 版同语义）
+        t = lowlight_dnn_blend_t(frame_t, session, self._p(), self._out_state)
+        self._last_dark = self._out_state["last_dark"]
+        return t
 
     @property
     def is_dark(self) -> bool:
@@ -120,7 +150,7 @@ class LowLightDnnEffect(Effect):
         return self._session.provider if self._session is not None else ""
 
     def inference_interval(self, need: str) -> int:
-        # ONNX 推理不走 MediaPipe 聚合（needs 为空），这里仅作自声明，
+        # ONNX/torch 推理不走 MediaPipe 聚合（needs 为空），这里仅作自声明，
         # 供 GUI 显示与 CLI 评测读取口径。
         return max(1, int(self._p()["infer_interval"]))
 
@@ -128,6 +158,8 @@ class LowLightDnnEffect(Effect):
         """清空跨帧状态（切换采集源 / 逐张独立批跑前调用）。"""
         self._last_enhanced = None
         self._frame_seen = 0
+        self._out_state = {"last_dark": False,
+                           "last_enhanced_t": None, "frame_seen": 0}
 
     def set_enabled(self, on: bool) -> None:
         super().set_enabled(on)
@@ -135,19 +167,27 @@ class LowLightDnnEffect(Effect):
             self.reset_temporal()
 
     def _get_session(self):
-        """懒加载/换档 SCI 会话；失败（缺权重/缺 onnxruntime）告警一次并透传。"""
-        level = self._p()["level"]
-        if self._session is not None and self._session_level == level:
+        """懒加载/换档会话；失败（缺权重/缺运行时）告警一次并透传。"""
+        p = self._p()
+        key = (p["engine"], p["engine"] == "sci" and p["level"] or "")
+        if self._session is not None and self._session_key == key:
             return self._session
         try:
-            from ..infer import get_lowlight_session
-            self._session = get_lowlight_session(level)
-            self._session_level = level
+            if p["engine"] == "retinex":
+                from ..infer import get_lowlight_session
+                self._session = get_lowlight_session(
+                    p["level"], engine="retinex")
+            else:
+                from ..infer import get_lowlight_session
+                self._session = get_lowlight_session(
+                    p["level"], engine="auto")
+            self._session_key = key
         except Exception as exc:   # noqa: BLE001 —— 缺权重属预期部署形态
             self._session = None
+            self._session_key = None
             if not self._warned:
                 self._warned = True
-                print(f"[低光 SCI] 会话不可用，效果透传：{exc}")
+                print(f"[低光 {p['engine']}] 会话不可用，效果透传：{exc}")
         return self._session
 
     def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
@@ -170,7 +210,7 @@ class LowLightDnnEffect(Effect):
             session = self._get_session()
             if session is None:
                 return frame
-            # 512×512 推理 → resize 回原尺寸（纵横比畸变只存在于推理域）
+            # 方形推理域 → resize 回原尺寸（纵横比畸变只存在于推理域）
             rgb = session.enhance(frame)
             out = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)   # float32 [0,1]
             out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)

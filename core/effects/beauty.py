@@ -508,6 +508,7 @@ class BeautyEffect(Effect):
 
     name = "beauty"
     needs = frozenset({NEED_FACES})
+    supports_gpu = True          # 张量快路径见 _torch_impl.beauty_process_t
 
     @staticmethod
     def default_params() -> dict:
@@ -518,7 +519,12 @@ class BeautyEffect(Effect):
             "slim": 0.40,        # 瘦脸强度 0~1
             "eye_enabled": False,  # 大眼开关（一期默认关）
             "eye_strength": 0.18,   # 大眼强度 0~0.5（一期 0.18）
+            "finish": True,        # 收尾中值去噪与锐化；实时自然档可关闭
         }
+
+    def process_gpu(self, frame_t, ctx: FrameContext):
+        from ._torch_impl import beauty_process_t
+        return beauty_process_t(frame_t, ctx, self._p())
 
     def process(self, frame: np.ndarray, ctx: FrameContext) -> np.ndarray:
         if not self.enabled:     # 防御直接调用；Pipeline 本身也会跳过
@@ -554,9 +560,10 @@ class BeautyEffect(Effect):
                                      yaw_deg=yaw)
 
         # 4. 收尾：轻去噪 + 锐化防糊（一期口径）
-        frame = cv2.medianBlur(frame, 3)
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-        frame = cv2.filter2D(frame, -1, kernel)
+        if p["finish"]:
+            frame = cv2.medianBlur(frame, 3)
+            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+            frame = cv2.filter2D(frame, -1, kernel)
         return frame
 
     @staticmethod

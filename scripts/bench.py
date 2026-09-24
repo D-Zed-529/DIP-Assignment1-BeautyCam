@@ -23,10 +23,14 @@ from __future__ import annotations
 import argparse
 import gc
 import os
-import resource
 import sys
 import time
 from pathlib import Path
+
+try:                       # POSIX 专属；Windows 走 psapi 兜底
+    import resource
+except ImportError:        # pragma: no cover - Windows
+    resource = None
 
 import cv2
 import numpy as np
@@ -63,14 +67,65 @@ def letterbox(img: np.ndarray, w: int, h: int) -> np.ndarray:
 
 
 def rss_mb() -> float:
-    """当前进程峰值驻留内存（MB）。macOS 的 ru_maxrss 单位是字节。"""
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+    """当前进程峰值驻留内存（MB）。macOS 的 ru_maxrss 单位是字节，
+    Windows 用 GetProcessMemoryInfo 的 PeakWorkingSetSize（同为字节）。"""
+    if resource is not None:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
+    import ctypes
+    import ctypes.wintypes
+    class PMC(ctypes.Structure):
+        _fields_ = [("cb", ctypes.wintypes.DWORD),
+                    ("PageFaultCount", ctypes.wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t)]
+    pmc = PMC()
+    pmc.cb = ctypes.sizeof(PMC)
+    # GetProcessMemoryInfo 在 psapi.dll（kernel32 里叫 K32GetProcessMemoryInfo，
+    # 且需要精确的 ctypes 原型才不崩 —— psapi 更稳，失败就退 0 不阻塞基准）
+    try:
+        ctypes.windll.psapi.GetProcessMemoryInfo(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            ctypes.byref(pmc), pmc.cb)
+        return float(pmc.PeakWorkingSetSize) / (1024.0 * 1024.0)
+    except OSError:
+        return 0.0
 
 
-def bench(name: str, fn, calls: int = OP_CALLS, warmup: int = 1) -> float:
-    """固定次数计均值：先预热（懒加载/内核编译不计入），再跑 calls 次取均值。"""
+def gpu_spin(n: int = 24) -> None:
+    """GPU 空转拉时钟（笔记本 GPU 空闲即降频，短基准会虚高；
+    有 CUDA 时跑几次大矩阵乘把频率顶上去）。"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        a = torch.randn(2048, 2048, device="cuda")
+        with torch.no_grad():
+            for _ in range(n):
+                a = a @ a * 0.001
+        torch.cuda.synchronize()
+        del a
+    except Exception:   # noqa: BLE001 —— 无 CUDA 环境直接跳过
+        pass
+
+
+def bench(name: str, fn, calls: int = OP_CALLS, warmup: int = 1,
+          spin: bool = False) -> float:
+    """固定次数计均值：先预热（懒加载/内核编译不计入），再跑 calls 次取均值。
+
+    spin=True 时预热前先空转 GPU 拉时钟（推理类基准用，笔记本降频口径防虚高）。
+    """
+    if spin:
+        gpu_spin()
     for _ in range(warmup):
         fn()
+    if spin:
+        gpu_spin(8)
     t0 = time.perf_counter()
     for _ in range(calls):
         fn()
@@ -126,19 +181,27 @@ def main() -> int:
     engine = None
     try:
         engine = get_engine()
-        section("推理分解（MediaPipe，同帧重复）")
+        section(f"推理分解（{engine.backend_name}，同帧重复）")
         record("FaceMesh",
                bench("FaceMesh", lambda: engine.process(
                    frame, faces=True, hands=False, segmentation=False),
-                   calls=OP_INFER_CALLS))
+                   calls=OP_INFER_CALLS, warmup=3, spin=True))
         record("HandLandmarker",
                bench("Hands", lambda: engine.process(
                    frame, faces=False, hands=True, segmentation=False),
-                   calls=OP_INFER_CALLS))
-        record("分割(二元)",
-               bench("分割 binary", lambda: engine.process(
+                   calls=OP_INFER_CALLS, warmup=3, spin=True))
+        record(f"分割({engine.segmenter_model})",
+               bench(f"分割 {engine.segmenter_model}", lambda: engine.process(
                    frame, faces=False, hands=False, segmentation=True),
-                   calls=OP_INFER_CALLS))
+                   calls=OP_INFER_CALLS, warmup=3, spin=True))
+        if getattr(engine, "backend_name", "").startswith("torch"):
+            try:
+                record("深度(DepthAnythingV2)",
+                       bench("深度估计", lambda: engine.process(
+                           frame, faces=False, hands=False, segmentation=False,
+                           depth=True), calls=OP_INFER_CALLS, warmup=3, spin=True))
+            except Exception as e:   # noqa: BLE001 —— 缺 DA-v2 权重属预期
+                print(f"  [跳过深度基准] {e}", flush=True)
         ctx = engine.process(frame, faces=True, hands=True, segmentation=True)
     except FileNotFoundError as e:
         print(f"\n[跳过推理分解] 模型缺失：{e}", flush=True)
@@ -201,6 +264,7 @@ def main() -> int:
 
     # ---- 6. 组合管线 ----
     if engine is not None:
+        torch_backend = getattr(engine, "backend_name", "").startswith("torch")
         section("组合管线（整链均摊，含推理）")
         combos = [
             ("美颜", dict(beauty=True)),
@@ -208,14 +272,20 @@ def main() -> int:
             ("美颜+虚化+低光(启发式)", dict(beauty=True, segment=True, lowlight=True)),
             ("自适应画质+美颜", dict(autoenhance=True, beauty=True)),
         ]
+        if torch_backend:
+            combos.append(("美颜+RVM虚化+深度渐进虚化",
+                           dict(beauty=True, segment=True, bokeh=True)))
         for label, on in combos:
+            from core.effects.bokeh import BokehEffect  # noqa: E402
             aex = AutoEnhanceEffect(enabled=on.get("autoenhance", False))
             beauty = BeautyEffect(enabled=on.get("beauty", False))
             segx = SegmentEffect(enabled=on.get("segment", False),
                                  params={"smooth": 0.0})
+            bkx = BokehEffect(enabled=on.get("bokeh", False),
+                              params={"strength": 0.7})
             lowx = LowLightEffect(enabled=on.get("lowlight", False),
                                   params={"auto": False})
-            pipe = Pipeline([aex, lowx, beauty, segx])
+            pipe = Pipeline([aex, lowx, beauty, segx, bkx])
             base = dark.copy() if on.get("lowlight") else frame.copy()
             state = {"i": 0}
 
@@ -223,43 +293,52 @@ def main() -> int:
                 needs = pipe.infer_needs_for(state["i"])
                 state["i"] += 1
                 c = engine.process(base, faces="faces" in needs, hands=False,
-                                   segmentation="segmentation" in needs)
+                                   segmentation="segmentation" in needs,
+                                   depth="depth" in needs)
                 return pipe.process(base.copy(), c)
 
-            ms = bench(label, step, calls=OP_INFER_CALLS)
+            ms = bench(label, step, calls=OP_INFER_CALLS, warmup=2, spin=True)
             record(label, ms)
             for e in pipe.effects():
                 e.reset_temporal()
-            del pipe, aex, beauty, segx, lowx, base
+            if hasattr(engine, "reset_temporal"):
+                engine.reset_temporal()   # RVM 循环状态在组合间隔离
+            del pipe, aex, beauty, segx, bkx, lowx, base
             gc.collect()
 
-    # ---- 7. 低光 ONNX：CPU vs CoreML ----
+    # ---- 7. 低光深度模型对比（torch 后端：SCI / Retinexformer；ONNX CPU 基线） ----
+    section("低光深度模型对比（512/512 推理域，暗帧）")
+    try:
+        from core.infer import get_lowlight_session
+        for engine_key, label in (("sci", "SCI-medium (torch CUDA)"),
+                                  ("retinex", "Retinexformer LOL-v1")):
+            try:
+                s = get_lowlight_session("medium", engine=engine_key)
+                bench(label, lambda s=s: s.enhance(dark), calls=OP_INFER_CALLS, warmup=2, spin=True)
+                lines.append(f"| {label}（{getattr(s, 'provider', '')}） |"
+                             f" 见 stdout |")
+                del s
+                gc.collect()
+            except Exception as e:   # noqa: BLE001 —— 缺权重属预期部署形态
+                print(f"  [跳过] {label}: {e}", flush=True)
+    except Exception as e:   # noqa: BLE001
+        print(f"  [跳过低光对比] {e}", flush=True)
     try:
         import onnxruntime as ort
         from core.infer import LOWLIGHT_LEVELS, MODELS_DIR
         dnn_path = MODELS_DIR / LOWLIGHT_LEVELS["medium"]
         if dnn_path.exists():
-            section("低光 SCI ONNX 执行后端对比（512×512）")
-            lines[-2:] = ["| 后端 | ms/次 |", "|---|---|"]
             small = cv2.resize(dark, (512, 512))
             x = preprocess_sci(small)
-            avail = ort.get_available_providers()
-            for prov in (["CoreMLExecutionProvider"], ["CPUExecutionProvider"]):
-                tag = prov[0].replace("ExecutionProvider", "")
-                if prov[0] not in avail:
-                    print(f"  [跳过] {tag} 不可用", flush=True)
-                    continue
-                try:
-                    sess = ort.InferenceSession(str(dnn_path), providers=prov)
-                    actual = sess.get_providers()[0]
-                    iname = sess.get_inputs()[0].name
-                    fn = lambda s=sess, n=iname: s.run(None, {n: x})
-                    ms = bench(f"SCI-medium ({tag})", fn, calls=OP_INFER_CALLS)
-                    lines.append(f"| {tag}（实际 {actual}） | {ms:.2f} |")
-                    del sess
-                    gc.collect()
-                except Exception as e:   # noqa: BLE001
-                    print(f"  [失败] {tag}: {e}", flush=True)
+            if "CPUExecutionProvider" in ort.get_available_providers():
+                sess = ort.InferenceSession(str(dnn_path),
+                                            providers=["CPUExecutionProvider"])
+                iname = sess.get_inputs()[0].name
+                bench("SCI-medium (ONNX CPU)",
+                      lambda s=sess, n=iname: s.run(None, {n: x}),
+                      calls=OP_INFER_CALLS)
+                del sess
+                gc.collect()
         else:
             print("\n[跳过] models/ SCI 权重不存在", flush=True)
     except ImportError:

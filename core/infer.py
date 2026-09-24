@@ -52,12 +52,17 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 MODEL_FILES = {
     "face_landmarker": "face_landmarker.task",
     "hand_landmarker": "hand_landmarker.task",
-    # Phase 3 自拍分割，两个模型都保留（切换见 InferenceEngine.set_segmenter_model）：
-    #   binary     二元「人 / 非人」，250KB，13.2ms —— 虚拟背景默认用它
+    # Phase 3 自拍分割，三个模型都保留（切换见 InferenceEngine.set_segmenter_model）：
+    #   binary     二元「人 / 非人」，250KB，13.2ms —— mediapipe 后端的默认
     #   multiclass 6 类（0背景/1头发/2躯体皮肤/3面部皮肤/4衣服/5其他），16.4MB，155ms
+    #   rvm        RobustVideoMatting resnet50（torch 后端专用，视频抠图质量档）
     "selfie_segmenter_binary": "selfie_segmenter.tflite",
     "selfie_segmenter": "selfie_multiclass_256x256.tflite",
 }
+
+# torch 后端（core/infer_torch.py）专用分割模型：RVM 官方 TorchScript。
+# mediapipe 引擎 set_segmenter_model("rvm") 会拒绝（无法执行 torch 模型）。
+RVM_TS_FILE = "rvm_resnet50.ts"
 
 # ------- Phase 2 低光增强（SCI，P2-1 定版依据见模块头新增记录） -------
 # SCI（Self-Calibrated Illumination, CVPR 2022）ONNX 化：54KB、固定 512×512
@@ -75,26 +80,33 @@ LOWLIGHT_DEFAULT_LEVEL = "medium"
 DEFAULT_SEGMENTER = "selfie_segmenter_binary"
 
 # 分割模型 -> 建议的推理间隔帧数（虚拟背景的 SegmentEffect 据此设置隔帧降载）。
-# 二元模型 13ms 可每帧跑；多分类 155ms 必须隔帧，靠时域平滑复用中间帧。
+# 二元模型 13ms 可每帧跑；多分类 155ms 必须隔帧，靠时域平滑复用中间帧；
+# RVM 自带循环时域状态且 GPU 上足够快（~15ms@720p/3060），每帧跑。
 SEGMENTER_INTERVAL = {
     "selfie_segmenter_binary": 1,
     "selfie_segmenter": 4,
+    "rvm": 1,
 }
 
-# 分割模型规格表 —— 两个模型的「类别编码」与「置信图极性」**恰好相反**，
-# 且搞反了不抛异常、只静默产出反转掩膜（人景对调）或全幅掩膜（什么都不换），
-# 所以必须按模型显式声明，不能靠启发式猜。
+# torch 后端才有的分割模型（GUI 下拉据此隐藏/禁用）
+TORCH_ONLY_SEGMENTERS = {"rvm"}
+
+# 分割模型规格表 —— 各模型的「类别编码」与「置信图极性**必须按模型显式声明**，
+# 且搞反了不抛异常、只静默产出反转掩膜（人景对调）或全幅掩膜（什么都不换）。
 #
 # 用**与假设无关的探针法**实测确认（图像四角必为背景、画面中下部必为人；
 # 见 tests/test_infer.py::TestSegmenterSemantics 的同一套探针）：
 #   binary     类别 0 = 人 / 255 = 背景，conf[0] = **人**的概率
 #   multiclass 类别 0 = 背景 / 1..5 = 人，conf[0] = **背景**的概率
+#   rvm        直接输出前景 alpha（无类别图概念；torch 引擎内部按 >0.5 二值化，
+#              person_is_zero=False 与 alpha_invert=False 即"cat>0 是人 / alpha 不取反"）
 #
 # 注意：这张表曾经两次被写反（"conf[0] 都是背景概率"看起来非常合理），
 # 因此配套的单测用探针法独立复核，而不是在表内自证。
 SEGMENTER_SPECS = {
     "selfie_segmenter_binary": {"person_is_zero": True, "alpha_invert": False},
     "selfie_segmenter": {"person_is_zero": False, "alpha_invert": True},
+    "rvm": {"person_is_zero": False, "alpha_invert": False},
 }
 
 # 边框先验自检阈值：画面边缘 alpha 均值超过它就告警（见 _self_check_border）
@@ -185,12 +197,17 @@ class InferenceEngine:
         )
         if segmenter_model not in SEGMENTER_SPECS:
             raise ValueError(f"未知分割模型：{segmenter_model}")
+        if segmenter_model in TORCH_ONLY_SEGMENTERS:
+            raise ValueError(
+                f"分割模型 {segmenter_model} 仅 torch 后端支持（本引擎是 "
+                f"mediapipe；需 models/torch/ 与 CUDA，见 core/infer_torch.py）")
         self._segmenter_key = segmenter_model
         self._face_lm: Optional[vision.FaceLandmarker] = None
         self._hand_lm: Optional[vision.HandLandmarker] = None
         self._segmenter: Optional[vision.ImageSegmenter] = None
         # 边框先验自检只做一次（告警用，不自动翻转掩膜）
         self._border_checked = False
+        self._depth_warned = False
         self._ts = 0          # VIDEO 模式时间戳必须严格递增
         self._frame_id = 0
         self._lock = threading.Lock()   # 会话懒加载互斥
@@ -210,10 +227,19 @@ class InferenceEngine:
         """当前分割模型建议的推理间隔帧数（GUI 据此设 SegmentEffect 的 infer_interval）。"""
         return SEGMENTER_INTERVAL[self._segmenter_key]
 
+    @property
+    def backend_name(self) -> str:
+        return "mediapipe:cpu"
+
     def set_segmenter_model(self, key: str) -> None:
         """切换分割模型（关闭旧会话，下次推理时重建）。"""
         if key not in SEGMENTER_SPECS:
             raise ValueError(f"未知分割模型：{key}")
+        if key in TORCH_ONLY_SEGMENTERS:
+            raise ValueError(
+                f"分割模型 {key} 仅 torch 后端支持（models/torch/ 下需有 "
+                f"{RVM_TS_FILE}；请先运行 scripts/convert_models.py 与 "
+                f"scripts/download_models.py，并确认 CUDA 可用）")
         with self._lock:
             if key == self._segmenter_key:
                 return
@@ -222,6 +248,10 @@ class InferenceEngine:
                 self._segmenter = None
             self._segmenter_key = key
             self._border_checked = False
+
+    def reset_temporal(self) -> None:
+        """接口对齐 torch 引擎（mediapipe VIDEO 模式自身无跨帧状态要清）。"""
+        self._ts += 1000   # 时间戳单调递增语义不受影响
 
     # ------- 会话懒加载 -------
 
@@ -279,8 +309,17 @@ class InferenceEngine:
 
     def process(self, frame_bgr: np.ndarray, *,
                 faces: bool = True, hands: bool = True,
-                segmentation: bool = False) -> FrameContext:
-        """跑一次全部所需推理，返回 FrameContext。frame 需为连续 BGR ndarray。"""
+                segmentation: bool = False,
+                depth: bool = False) -> FrameContext:
+        """跑一次全部所需推理，返回 FrameContext。frame 需为连续 BGR ndarray。
+
+        depth：mediapipe 后端不支持（torch 后端走 Depth Anything V2），
+        请求时告警一次并返回 ctx.depth=None，效果层自行降级。
+        """
+        if depth and not self._depth_warned:
+            self._depth_warned = True
+            print("[警告] 当前 mediapipe 后端不支持深度估计（需 torch 后端 + "
+                  "Depth Anything V2 权重），依赖深度的效果将降级。")
         h, w = frame_bgr.shape[:2]
         self._frame_id += 1
         self._ts += 33  # 约 30fps 的单调时间戳（VIDEO 模式要求严格递增即可）
@@ -340,19 +379,52 @@ class InferenceEngine:
         self._face_lm = self._hand_lm = self._segmenter = None
 
 
-# ------- 模块级单例 -------
+# ------- 模块级单例（含 torch 后端自动选择） -------
 
-_engine: Optional[InferenceEngine] = None
+_engine = None
 _engine_lock = threading.Lock()
 
 
-def get_engine() -> InferenceEngine:
-    """全局唯一 InferenceEngine（线程安全）。"""
+def torch_backend_ready(models_dir: Path | None = None) -> bool:
+    """torch 后端是否就绪：CUDA 可用 + 核心 TorchScript 已转换 + torch 可导入。"""
+    try:
+        import torch
+    except ImportError:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    base = Path(models_dir) if models_dir else MODELS_DIR
+    torch_dir = base / "torch"
+    core_models = ("face_detector.ts", "face_landmarks.ts",
+                   "face_blendshapes.ts", "hand_detector.ts",
+                   "hand_landmarks.ts")
+    return all((torch_dir / n).exists() for n in core_models)
+
+
+def get_engine(prefer: str = "auto"):
+    """全局唯一推理引擎（线程安全）。
+
+    后端选择（BEAUTYCAM CUDA 迁移）：
+      auto    torch 后端就绪（CUDA + TorchScript 齐）→ TorchInferenceEngine，
+              否则 mediapipe（Windows CPU 委托稳定）
+      torch   强制 torch（未就绪抛 FileNotFoundError，测试/校准用）
+      mediapipe 强制 mediapipe（基准对照用）
+    """
     global _engine
     if _engine is None:
         with _engine_lock:
             if _engine is None:
-                _engine = InferenceEngine()
+                if prefer == "torch" or (
+                        prefer == "auto" and torch_backend_ready()):
+                    from .infer_torch import TorchInferenceEngine
+                    _engine = TorchInferenceEngine()
+                elif prefer == "auto" or prefer == "mediapipe":
+                    _engine = InferenceEngine()
+                else:
+                    raise ValueError(f"未知引擎偏好：{prefer}")
+                print(f"[推理后端] {_engine.backend_name}"
+                      + (f"（分割模型 {_engine.segmenter_model}）"
+                         if hasattr(_engine, "segmenter_model") else ""))
     return _engine
 
 
@@ -377,7 +449,8 @@ def postprocess_sci(out: np.ndarray) -> np.ndarray:
 
 
 class LowLightSession:
-    """SCI 低光增强会话（CoreML EP 优先、CPU 回退，创建即打印实际 provider）。
+    """SCI 低光增强会话（ONNX Runtime；CUDA/CoreML EP 优先、CPU 回退，
+    创建即打印实际 provider）。
 
     与 MediaPipe 引擎分开放：生命周期独立（低光关掉时可释放）、模型按
     level 三选一。线程约定：只在工作线程 process 内使用（同 engine）。
@@ -393,7 +466,8 @@ class LowLightSession:
         if not path.exists():
             raise FileNotFoundError(
                 f"模型缺失：{path}，请先运行 python scripts/download_models.py")
-        wanted = [p for p in ("CoreMLExecutionProvider", "CPUExecutionProvider")
+        wanted = [p for p in ("CUDAExecutionProvider", "CoreMLExecutionProvider",
+                              "CPUExecutionProvider")
                   if p in ort.get_available_providers()]
         self.level = level
         self.sess = ort.InferenceSession(str(path), providers=wanted)
@@ -410,13 +484,39 @@ class LowLightSession:
         return postprocess_sci(out[1])   # [1] 是增强图（[0] 为中间量）
 
 
-_lowlight_sessions: dict[str, LowLightSession] = {}
+_lowlight_sessions: dict[str, "LowLightSessionTorch | LowLightSession"] = {}
 _lowlight_lock = threading.Lock()
 
 
-def get_lowlight_session(level: str = LOWLIGHT_DEFAULT_LEVEL) -> LowLightSession:
-    """SCI 会话按 level 缓存（GUI 切档时复用/重建）。"""
+def get_lowlight_session(level: str = LOWLIGHT_DEFAULT_LEVEL,
+                         engine: str = "auto"
+                         ) -> "LowLightSessionTorch | LowLightSession":
+    """低光深度会话按 (level, engine) 缓存（GUI 切档时复用/重建）。
+
+    engine：
+      auto / sci  SCI 三档。**默认 ONNX 会话**（v2 已验证基线，CPU EP
+                 3.6ms；onnx2torch 转出的 torch 版实测与 ONNX 输出 MAE
+                 0.15 —— 数值不忠实，只作 engine="torch" 的实验选项）；
+                 无 onnxruntime 的环境自动退 torch 版
+      torch      强制 torch 版（缺 TorchScript 抛 FileNotFoundError）
+      onnx       同 auto/sci（显式命名）
+      retinex    质量档 Retinexformer（LOL-v1，core/retinexformer.py）
+    """
+    key = f"{level}|{engine}"
     with _lowlight_lock:
-        if level not in _lowlight_sessions:
-            _lowlight_sessions[level] = LowLightSession(level)
-        return _lowlight_sessions[level]
+        if key not in _lowlight_sessions:
+            if engine == "retinex":
+                from .retinexformer import RetinexformerSession
+                _lowlight_sessions[key] = RetinexformerSession()
+            elif engine == "torch":
+                from .infer_torch import LowLightSessionTorch
+                _lowlight_sessions[key] = LowLightSessionTorch(level)
+            elif engine in ("auto", "sci", "onnx"):
+                try:
+                    _lowlight_sessions[key] = LowLightSession(level)
+                except ImportError:      # 无 onnxruntime：退 torch 版
+                    from .infer_torch import LowLightSessionTorch
+                    _lowlight_sessions[key] = LowLightSessionTorch(level)
+            else:
+                raise ValueError(f"未知低光引擎：{engine}")
+        return _lowlight_sessions[key]

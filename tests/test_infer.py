@@ -10,8 +10,8 @@ import numpy as np
 
 from core.context import FrameContext
 from core.infer import (
-    MODELS_DIR, SEGMENTER_SPECS, InferenceEngine, _landmarks_to_face_info,
-    border_foreground_ratio, category_to_person_mask,
+    MODELS_DIR, SEGMENTER_SPECS, TORCH_ONLY_SEGMENTERS, InferenceEngine,
+    _landmarks_to_face_info, border_foreground_ratio, category_to_person_mask,
     foreground_from_confidence,
 )
 
@@ -93,6 +93,12 @@ class TestSegmenterSpecs(unittest.TestCase):
         self.assertNotEqual(b["person_is_zero"], m["person_is_zero"])
         self.assertNotEqual(b["alpha_invert"], m["alpha_invert"])
 
+    def test_rvm_spec_exists_and_direct_alpha(self):
+        """RVM（torch 后端）直接输出前景 alpha：无类别图概念、不取反。"""
+        spec = SEGMENTER_SPECS["rvm"]
+        self.assertFalse(spec["person_is_zero"])
+        self.assertFalse(spec["alpha_invert"])
+
     def test_category_to_person_mask(self):
         cat_binary = np.array([[0, 255], [255, 0]], np.uint8)
         mask = category_to_person_mask(cat_binary, person_is_zero=True)
@@ -123,6 +129,11 @@ class TestSegmenterSpecs(unittest.TestCase):
     def test_unknown_model_rejected(self):
         with self.assertRaises(ValueError):
             InferenceEngine(segmenter_model="不存在")
+
+    def test_torch_only_model_rejected_by_mediapipe_engine(self):
+        """mediapipe 后端不能执行 RVM（TorchScript），必须显式报错而非静默。"""
+        with self.assertRaises(ValueError):
+            InferenceEngine(segmenter_model="rvm")
 
 
 @unittest.skipUnless(models_present() and _SAMPLE.exists(),
@@ -158,7 +169,10 @@ class TestSegmenterSemantics(unittest.TestCase):
             engine.close()
 
     def test_person_is_foreground_in_both_models(self):
-        for key in SEGMENTER_SPECS:
+        # RVM 是 torch-only（mediapipe 引擎跑不了），只在 mediapipe 可执行
+        # 的模型上探针复核；torch 引擎的 RVM 探针见 tests/test_infer_torch.py
+        for key in [k for k in SEGMENTER_SPECS
+                    if k not in TORCH_ONLY_SEGMENTERS]:
             with self.subTest(model=key):
                 ctx = self._ctx(key)
                 alpha = ctx.person_alpha
