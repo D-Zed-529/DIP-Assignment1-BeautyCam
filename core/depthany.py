@@ -63,6 +63,13 @@ class DepthSession:
         self._lock = threading.Lock()
         self._graph = None
         self._use_graph = use_graph and dev == "cuda"
+        if self._use_graph:
+            # 首次多模型推理会在独立 CUDA stream 中并发执行。Graph 捕获必须
+            # 在提交这些任务前完成，否则别的模型发 kernel 会使捕获失败，
+            # 甚至让本次 CUDA 上下文不可再用。
+            from .cudagraph import GraphedCall
+            sample = torch.zeros((1, 3, self.size, self.size), device=dev)
+            self._graph = GraphedCall(self._forward, "depth_anything", [sample])
 
     def reset(self) -> None:
         """清空时域归一化状态（切换采集源时调用）。"""

@@ -76,10 +76,13 @@ class GraphedCall:
         if self._graph is None:
             with torch.no_grad():
                 return _clone_out(self._fn(*args))
-        for buf, a in zip(self._static_in, args):
-            buf.copy_(a, non_blocking=True)
-        self._graph.replay()
-        return _clone_out(self._static_out)
+        # Graph 可能在 GUI 的 inference_mode 中首次创建，静态缓冲随之
+        # 成为 inference tensor；离线脚本随后直调时仍需允许写入该缓冲。
+        with torch.inference_mode():
+            for buf, a in zip(self._static_in, args):
+                buf.copy_(a, non_blocking=True)
+            self._graph.replay()
+            return _clone_out(self._static_out)
 
 
 def graph_call(fn: Callable[..., Any], name: str,
