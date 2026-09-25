@@ -18,8 +18,9 @@ models/
 *.pth
 *.tflite
 
-# 大文件：141MB 的答辩 PPT 超过 GitHub 100MB 单文件限制，不入库
+# 大型 PPT 不入库；课程汇报文件单独纳入版本管理
 *.pptx
+!BeautyCam大作业汇报.pptx
 
 # IDE
 .idea/
