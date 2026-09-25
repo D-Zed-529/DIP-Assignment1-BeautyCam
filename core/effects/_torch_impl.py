@@ -228,12 +228,30 @@ def beauty_process_t(f_u8: torch.Tensor, ctx, p: dict) -> torch.Tensor:
 
     if p["smooth"] > 0:
         f = beauty_smooth(f, p["smooth"])
-    if p["whiten"] > 0:
+    if p["whiten"] > 0 and ctx.faces:
         alpha = skin_mask(f)
-        if p["whiten_scope"] == "face" and ctx.faces:
+        if p["whiten_scope"] == "face":
             oval = oval_mask_torch(h, w, [fc.landmarks for fc in ctx.faces])
             if oval is not None:
                 alpha = torch.minimum(alpha, oval)
+        else:
+            person = ctx.person_alpha_t
+            if person is not None:
+                if person.shape[-2:] != (h, w):
+                    person = F.interpolate(person, size=(h, w), mode="bilinear",
+                                           align_corners=False)
+                # 多分类分割的背景概率地板不能参与美白。
+                person = torch.where(person >= 0.1, person.clamp(0, 1), 0.0)
+            else:
+                region = ctx.person_mask
+                if region is None:
+                    from .beauty import person_region_mask
+                    region = person_region_mask(np.empty((h, w), np.uint8), ctx.faces)
+                person = torch.from_numpy(np.ascontiguousarray(region))[None, None].to(f.device)
+                person = person.float() / 255.0
+                if person.shape[-2:] != (h, w):
+                    person = F.interpolate(person, size=(h, w), mode="nearest")
+            alpha = torch.minimum(alpha, person)
         if float(alpha.max()) > 0.01:
             f = whiten_lab(f, alpha, p["whiten"])
 
@@ -389,10 +407,13 @@ def segment_background_t(effect, p: dict,
 
 def autoenhance_process_t(f_u8: torch.Tensor, effect, ctx) -> torch.Tensor:
     """AutoEnhanceEffect.process 的 GPU 版（张量进出）。"""
-    from .autoenhance import (BG_TARGET_L, CLAHE_TILES, FACE_MIN_PIXELS,
-                              FACE_TARGET_L, SAT_SCALE_MAX, WB_GAIN_MAX,
-                              WB_GAIN_MIN, ema_tuple, gamma_for_exposure,
-                              gamma_lut)
+    from .autoenhance import (BG_TARGET_L, CLAHE_TILES, DETAIL_BASE_DOWNSCALE,
+                              DETAIL_BASE_MIN, DETAIL_BASE_SIGMA_RATIO,
+                              FACE_MIN_PIXELS, FACE_TARGET_L,
+                              PARTITION_FEATHER_MIN, PARTITION_FEATHER_RATIO,
+                              SAT_SCALE_MAX, WB_GAIN_MAX, WB_GAIN_MIN,
+                              ema_tuple, face_target_backlight_damp,
+                              gamma_for_exposure, gamma_lut)
     p = effect._p()
     if p["strength"] <= 0:
         return f_u8
@@ -406,7 +427,14 @@ def autoenhance_process_t(f_u8: torch.Tensor, effect, ctx) -> torch.Tensor:
     if ctx.faces:
         soft = oval_mask_torch(h, w, [fc.landmarks for fc in ctx.faces])
         if soft is not None and int((soft >= 0.5).sum()) >= FACE_MIN_PIXELS:
-            mask01_t = soft
+            # 分区曝光使用宽羽化；低分辨率处理大 sigma，保持 GPU 链吞吐。
+            sh, sw = max(h // 4, 1), max(w // 4, 1)
+            sigma = max(PARTITION_FEATHER_MIN,
+                        PARTITION_FEATHER_RATIO * min(h, w))
+            small = F.interpolate(soft, size=(sh, sw), mode="area")
+            mask01_t = F.interpolate(
+                gaussian_blur(small, sigma / 4.0), size=(h, w),
+                mode="bilinear", align_corners=False)
             face_bin_t = (soft >= 0.5).float()
 
     # ---- 1) 灰世界白平衡（背景区估计） ----
@@ -446,26 +474,40 @@ def autoenhance_process_t(f_u8: torch.Tensor, effect, ctx) -> torch.Tensor:
     if face_bin_t is not None:
         bgm = 1.0 - face_bin_t
         # 人脸/背景面积与亮度和打包下载，避免逐标量触发多次 D2H 同步。
+        l_stats = L8.float()
         stats = torch.stack((face_bin_t.sum(), bgm.sum(),
-                             (L * face_bin_t).sum(), (L * bgm).sum()))
+                             (l_stats * face_bin_t).sum(),
+                             (l_stats * bgm).sum()))
         n_f, n_b, l_f, l_b = stats.detach().cpu().numpy()
         face_mean = float(l_f / n_f) if n_f > 0 else None
         bg_mean = float(l_b / n_b) if n_b > 0 else None
     else:
-        bg_mean = float(L.mean())
+        bg_mean = float(L8.float().mean())
 
     face_target = BG_TARGET_L + float(p["face_exposure"]) * (
         FACE_TARGET_L - BG_TARGET_L)
+    face_target = face_target_backlight_damp(face_target, bg_mean, face_mean)
     g_face = gamma_for_exposure(face_mean, face_target)
     g_bg = gamma_for_exposure(bg_mean, BG_TARGET_L)
     effect._ema_face = ema_tuple(effect._ema_face, (g_face,), float(p["smooth"]))
     effect._ema_bg = ema_tuple(effect._ema_bg, (g_bg,), float(p["smooth"]))
     lut_f = torch.from_numpy(gamma_lut(effect._ema_face[0]))[None].to(dev)
     lut_b = torch.from_numpy(gamma_lut(effect._ema_bg[0]))[None].to(dev)
-    v = L8[:, 0].long()                                # (1,H,W) 量化 L
-    Lq = lut_b[0][v]
+    # gamma 只作用于低频照明层，回加修正场保留五官与皮肤局部明暗。
+    d = DETAIL_BASE_DOWNSCALE
+    sh, sw = max(h // d, 1), max(w // d, 1)
+    small_l = F.interpolate(L8.float(), size=(sh, sw), mode="area").round()
+    sigma = max(DETAIL_BASE_MIN, DETAIL_BASE_SIGMA_RATIO * min(h, w))
+    small_base = gaussian_blur(small_l, sigma / d).round().clamp(0, 255)
+    v = small_base[:, 0].long()
+    small_new = lut_b[0][v]
     if mask01_t is not None:
-        Lq = Lq + (lut_f[0][v] - lut_b[0][v]) * mask01_t
+        small_mask = F.interpolate(mask01_t, size=(sh, sw), mode="area")[:, 0]
+        small_new = small_new + (lut_f[0][v] - small_new) * small_mask
+    small_corr = (small_new - small_base[:, 0]).unsqueeze(1)
+    corr = F.interpolate(small_corr, size=(h, w), mode="bilinear",
+                         align_corners=False)
+    Lq = L8.float() + corr
 
     if p["contrast"] > 0:
         L8_new = gpu.clahe_lut(Lq.round_().clamp_(0, 255).to(torch.uint8),

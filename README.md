@@ -20,11 +20,11 @@ FaceMesh / Hands 保持 MediaPipe 原模型（已转 TorchScript 上 GPU，对 m
 |------|------|
 | 分层架构 | `core/`（处理核心，禁 import GUI）/ `gui/`（PySide6 壳）/ `scripts/`（headless 评测 CLI）严格分离 |
 | **统一推理（双后端）** | `core/infer.py::get_engine()` 自动选择：CUDA + TorchScript 就绪 → `TorchInferenceEngine`（全 GPU，含跟踪状态机），否则回退 MediaPipe CPU。每帧一次推理结果放 `FrameContext` 共享 |
-| 美颜（全参数化） | 双边滤波磨皮 / LAB 美白（全身肤色或仅脸部）/ 瘦脸（下颌链 liquify 真变形）/ 大眼（remap 向量化）/ 收尾锐化 |
+| 美颜（全参数化） | 双边滤波磨皮 / LAB 美白（人像区域或仅脸部；可选分割软掩膜精准圈人，避免背景同色误白）/ 瘦脸（下颌链 liquify 真变形）/ 大眼（remap 向量化）/ 收尾锐化 |
 | **RVM 人像抠图** | 官方 TorchScript（mobilenetv3 fp32，~8ms/帧@720p），4 层循环时域状态，发丝级 alpha；隔帧降载、边缘精修（guided filter）全保留；resnet50 高质量档可切换（离线出图） |
 | **深度渐进虚化（P3-4）** | Depth Anything V2 相对深度 → 焦平面对齐人物 → 模糊量随深度连续变化（sigma 金字塔 + 相邻档插值），观感对齐单反镜头 |
 | 低光增强（双引擎） | **SCI 快速档**（默认 ONNX Runtime；torch CUDA 为实验路径）+ **Retinexformer 质量档**（ICCV 2023，LOL-v1 25.16dB，~67ms，隔帧推理摊薄）；启发式基线保留（"经典 vs 深度"对比线） |
-| 自适应画质优化 | FaceMesh 分区统计直方图 → 人脸/背景各自 gamma 自动曝光 → CLAHE → 灰世界白平衡 → LAB 饱和度，统计量 EMA 时域平滑 |
+| 自适应画质优化 | FaceMesh 分区统计直方图 → 人脸/背景细节保留 gamma 自动曝光（宽羽化、逆光抑制）→ CLAHE → 灰世界白平衡 → LAB 饱和度，统计量 EMA 时域平滑 |
 | 自动 HDR 拍照 | 连拍 → gamma 模拟包围曝光 → ECC 对齐 → Mertens 融合 → 可选 Drago/Reinhard 色调映射 |
 | 换脸（演示级） | 离线演示与相机实时预览；复用当前帧 FaceMesh，缓存源脸三角网；Delaunay 分块仿射 → 泊松融合 → Reinhard 色彩迁移；内置 4 张原创虚构头像，也可自行上传；CLI/GUI 均有授权确认门 |
 | 手势 / 笑脸拍照 | V 手势（墙钟持续 1s）+ 笑脸（blendshapes mouthSmile 置信度），torch 后端下 blendshapes 由 HUND 头部网络计算（146 点子集·像素坐标输入） |

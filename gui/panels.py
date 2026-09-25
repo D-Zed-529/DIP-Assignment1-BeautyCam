@@ -123,21 +123,27 @@ class BeautyPanel(QGroupBox):
             lambda on: self.pipeline.set_params(
                 "beauty", whiten_scope="face" if on else "skin"))
         grid.addWidget(self.chk_face_only, 3, 0, 1, 3)
+        self.chk_whiten_precise = QCheckBox("精准人像美白（启用分割）")
+        self.chk_whiten_precise.setChecked(p["whiten_precise"])
+        self.chk_whiten_precise.setToolTip(
+            "用分割软掩膜排除人像附近的同色背景；单独开启会增加推理耗时")
+        self.chk_whiten_precise.toggled.connect(self._set("whiten_precise"))
+        grid.addWidget(self.chk_whiten_precise, 4, 0, 1, 3)
         grid.addWidget(SliderRow("瘦脸", 0.0, 1.0, p["slim"],
-                                 self._set("slim")), 4, 0, 1, 3)
+                                 self._set("slim")), 5, 0, 1, 3)
 
         self.chk_eye = QCheckBox("大眼")
         self.chk_eye.setChecked(p["eye_enabled"])
         self.chk_eye.toggled.connect(self._set("eye_enabled"))
-        grid.addWidget(self.chk_eye, 5, 0)
+        grid.addWidget(self.chk_eye, 6, 0)
         grid.addWidget(SliderRow("大眼强度", 0.0, 0.5, p["eye_strength"],
-                                 self._set("eye_strength")), 5, 1, 1, 2)
+                                 self._set("eye_strength")), 6, 1, 1, 2)
 
         self.chk_finish = QCheckBox("收尾去噪与锐化")
         self.chk_finish.setChecked(p["finish"])
         self.chk_finish.setToolTip("默认关闭，避免实时预览出现过锐的边缘和失去皮肤纹理")
         self.chk_finish.toggled.connect(self._set("finish"))
-        grid.addWidget(self.chk_finish, 6, 0, 1, 3)
+        grid.addWidget(self.chk_finish, 7, 0, 1, 3)
 
     def _set(self, key: str):
         return lambda v: self.pipeline.set_params("beauty", **{key: v})

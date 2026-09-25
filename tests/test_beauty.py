@@ -248,6 +248,18 @@ class TestWhitenScope(unittest.TestCase):
 
     BOX = (0.3, 0.2, 0.7, 0.8)   # 与 synth_face_landmarks 的脸椭圆一致
 
+    def test_precise_whitening_requests_segmentation_only_when_needed(self):
+        from core.pipeline import NEED_FACES, NEED_SEGMENTATION
+
+        effect = BeautyEffect()
+        self.assertEqual(effect.needs, frozenset({NEED_FACES}))
+        effect.set_params(whiten_precise=True)
+        self.assertIn(NEED_SEGMENTATION, effect.needs)
+        effect.set_params(whiten_scope="face")
+        self.assertNotIn(NEED_SEGMENTATION, effect.needs)
+        effect.set_params(whiten_scope="skin", whiten=0.0)
+        self.assertNotIn(NEED_SEGMENTATION, effect.needs)
+
     def _paint_skin(self, frame, x1, x2, y1, y2):
         frame[y1:y2, x1:x2] = np.uint8(SKIN_BGR)
         return frame

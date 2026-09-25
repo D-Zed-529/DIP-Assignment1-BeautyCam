@@ -73,6 +73,19 @@ class TestGpuCpuBoundary(unittest.TestCase):
         out = Pipeline([effect], use_gpu=True).process(frame, ctx)
         self.assertTrue(np.all(out == np.array([64, 177, 0], np.uint8)))
 
+    def test_gpu_autoenhance_without_face(self):
+        """无人脸时 GPU 自动曝光也须返回与输入同尺寸的 BGR 帧。"""
+        from core.context import FrameContext
+        from core.effects.autoenhance import AutoEnhanceEffect
+
+        frame = np.full((64, 96, 3), 70, np.uint8)
+        effect = AutoEnhanceEffect(params={"color": 0.0, "contrast": 0.0,
+                                           "smooth": 0.0})
+        out = Pipeline([effect], use_gpu=True).process(
+            frame, FrameContext(width=96, height=64))
+        self.assertEqual(out.shape, frame.shape)
+        self.assertGreater(float(out.mean()), float(frame.mean()))
+
 
 def _sample_720p():
     img = cv2.imread(str(_SAMPLE))
@@ -203,6 +216,41 @@ class TestGpuFusedPipeline(unittest.TestCase):
                                                    - self.img.astype(int)) > 5), 100)
         self.assertLess(np.abs(gpu_out.astype(int) - cpu_out.astype(int)).mean(),
                         0.1)
+
+    def test_gpu_autoenhance_matches_cpu_exposure(self):
+        """实时 GPU 曝光与 CPU 分区曝光保持相近亮度，并走通有脸路径。"""
+        from core.effects.autoenhance import AutoEnhanceEffect
+
+        ctx = self.engine.process(self.img, faces=True, hands=False,
+                                  segmentation=False, blendshapes=False)
+        if not ctx.faces:
+            self.skipTest("样例图未检测到人脸")
+        params = {"strength": 1.0, "color": 0.0, "contrast": 0.0,
+                  "saturation": 0.0, "smooth": 0.0}
+        gpu_eff = AutoEnhanceEffect(params=params)
+        cpu_eff = AutoEnhanceEffect(params=params)
+        gpu_out = Pipeline([gpu_eff], use_gpu=True).process(self.img.copy(), ctx)
+        cpu_out = cpu_eff.process(self.img.copy(), ctx)
+        self.assertEqual(gpu_out.shape, self.img.shape)
+        self.assertLess(abs(float(gpu_out.mean()) - float(cpu_out.mean())), 8.0)
+
+    def test_gpu_whitening_respects_empty_person_matte(self):
+        """人像掩膜全空时，GPU 美白不得改变肤色背景。"""
+        import torch
+        from core.effects.beauty import BeautyEffect
+
+        ctx = self.engine.process(self.img, faces=True, hands=False,
+                                  segmentation=False, blendshapes=False)
+        if not ctx.faces:
+            self.skipTest("样例图未检测到人脸")
+        h, w = self.img.shape[:2]
+        ctx.person_alpha_t = torch.zeros(1, 1, h, w, device="cuda")
+        effect = BeautyEffect(params={"smooth": 0.0, "whiten": 20.0,
+                                      "slim": 0.0, "eye_enabled": False,
+                                      "finish": False})
+        out = Pipeline([effect], use_gpu=True).process(self.img.copy(), ctx)
+        self.assertLess(np.abs(out.astype(int) - self.img.astype(int)).mean(),
+                        0.01)
 
 
 if __name__ == "__main__":

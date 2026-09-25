@@ -176,6 +176,8 @@ def main() -> int:
                     help="关闭美颜")
     ap.add_argument("--smooth", type=float, default=0.6, help="磨皮 0~1")
     ap.add_argument("--whiten", type=float, default=15.0, help="美白 0~30")
+    ap.add_argument("--whiten-precise", action="store_true",
+                    help="精准人像美白：单独请求分割模型排除同色背景")
     ap.add_argument("--slim", type=float, default=0.35, help="瘦脸 0~1")
     ap.add_argument("--eye", type=float, default=0.0, help="大眼强度 0~0.5（0=关）")
     ap.add_argument("--lowlight", action="store_true", help="启用启发式低光增强")
@@ -264,6 +266,7 @@ def main() -> int:
                 "saturation": args.ae_sat, "smooth": args.ae_smooth})
     beauty = BeautyEffect(enabled=args.beauty and not args.raw, params={
         "smooth": args.smooth, "whiten": args.whiten,
+        "whiten_precise": args.whiten_precise,
         "slim": args.slim, "eye_enabled": args.eye > 0,
         "eye_strength": args.eye,
     })
