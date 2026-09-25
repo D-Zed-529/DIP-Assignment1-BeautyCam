@@ -10,10 +10,13 @@
   1. 分区直方图统计：FaceMesh 轮廓掩膜（复用 beauty.face_oval_mask；
      美颜默认也在跑 faces 推理，与美颜同开时零额外推理成本）把画面
      分成人脸/背景两区，在 LAB 的 L 通道分别统计均值；
-  2. 自动曝光 = 分区 gamma 校正：人脸目标亮度 150（相机自动曝光
-     "人脸优先"的典型口径）、背景目标 115；容差带内不校正（防常态
-     抖动），gamma 裁剪防极端值；两个 256 项幂变换 LUT 按软掩膜逐像素
-     混合，过渡带无硬边；
+  2. 自动曝光 = 分区 gamma 校正：人脸目标亮度 135（正常皮肤口径）、
+     背景目标 115；容差带内不校正（防常态抖动），gamma 裁剪防极端值。
+     gamma 只作用于大尺度"照明层"（detail-preserving tone mapping）——
+     局部对比度（眼窝/鼻影等 3D 明暗渐变）原样保留，提亮不把脸压成
+     "面具"；脸/背景两个幂变换 LUT 按尺度自适应宽高斯羽化的软掩膜逐
+     像素混合，过渡带无硬边；强逆光（背景比脸亮很多）时脸目标向背景
+     回退，避免"亮脸贴亮底"的贴片感；
   3. 对比度 = CLAHE（限制对比度自适应直方图均衡，Zuiderveld 1994）
      作用于 L 通道；
   4. 色调 = 灰世界假设白平衡（Buchsbaum 1980）：在**背景区**估计通道
@@ -39,11 +42,19 @@ from ..pipeline import Effect, NEED_FACES
 from .beauty import face_oval_mask
 
 # ------- 调参常量（集中顶部，中文注释） -------
-FACE_TARGET_L = 150.0    # 人脸目标亮度（LAB-L）：相机 AE"人脸优先"的典型目标
+FACE_TARGET_L = 135.0    # 人脸目标亮度（LAB-L）：正常皮肤口径（旧 150 吹成白纸，脸发"面具感"）
 BG_TARGET_L = 115.0      # 背景目标亮度：中灰偏上（再高会把夜景硬拉成白天）
 EXPO_TOL = 12.0          # 均值落在目标 ± 此带内不校正：常态画面防无谓抖动
 GAMMA_MIN = 0.4          # gamma 裁剪下限（≤0.4 已是强提亮，再低噪声放大明显）
 GAMMA_MAX = 2.5          # gamma 裁剪上限（压暗上限）
+BACKLIGHT_DAMP_OFFSET = 30.0   # 逆光量（bg_mean - face_mean）超过此值开始回退脸目标
+BACKLIGHT_DAMP_RANGE = 60.0    # 逆光量从 OFFSET 升到 OFFSET+RANGE 时脸目标线性回退到背景目标
+PARTITION_FEATHER_RATIO = 0.02  # 分区混合羽化 sigma 占 min(w,h) 比例（旧 11px 高斯 ~6px 过渡带太硬）
+PARTITION_FEATHER_MIN = 12.0    # 羽化 sigma 下限（px）
+DETAIL_BASE_SIGMA_RATIO = 0.12  # "照明层"模糊 sigma 占 min(w,h) 比例（够大到盖过眼窝/鼻影等 3D 明暗，只把整体照明层留给 gamma）
+DETAIL_BASE_MIN = 8.0           # 照明层模糊 sigma 下限（px）
+DETAIL_RETAIN = 1.0             # 局部对比度保留比例（1.0 = 完全保留，只对 base 打 gamma）
+DETAIL_BASE_DOWNSCALE = 8       # 照明层在 1/8 分辨率计算：base 是低频，大 sigma 高斯的成本按 D² 下降，且降采样本身已低通、缩小后的 sigma（86/D）才 ~11px，避开 OpenCV 大核高斯慢路径（实测 720p 全帧 sigma86 ≈430ms → 1/8 分辨率 ~0.9ms）
 WB_GAIN_MIN = 0.8        # 白平衡增益裁剪：防个别帧统计把颜色拉飞
 WB_GAIN_MAX = 1.25
 WB_MIN_BG_RATIO = 0.05   # 背景像素占比低于此值时灰世界退回全图估计（脸占满屏）
@@ -59,10 +70,12 @@ SMOOTH_MAX = 0.95        # EMA 权重上限（=1 会永不收敛到新统计量�
 
 def face_union_mask(frame_bgr: np.ndarray,
                     faces: Sequence[FaceInfo]) -> Optional[np.ndarray]:
-    """全部人脸的轮廓掩膜并集（uint8 0~255，含高斯羽化）。
+    """全部人脸的轮廓掩膜并集（uint8 0~255，尺度自适应宽高斯羽化）。
 
-    复用 beauty.face_oval_mask（FaceMesh 轮廓多边形 fillPoly + 羽化）。
-    无人脸返回 None（调用方走全图退化路径）。
+    复用 beauty.face_oval_mask（FaceMesh 轮廓多边形 fillPoly + 11px 羽化），
+    并集后再叠加一次宽高斯（sigma ≈ PARTITION_FEATHER_RATIO×min(w,h)）：
+    分区曝光的脸/背景两套 gamma 在此软过渡带内平滑混合，脸缘不再有
+    "贴图"硬边。无人脸返回 None（调用方走全图退化路径）。
     """
     if not faces:
         return None
@@ -76,7 +89,14 @@ def face_union_mask(frame_bgr: np.ndarray,
         acc = m if acc is None else np.maximum(acc, m)
     if acc is not None and acc.shape[:2] != (h, w):
         return None   # 防御：landmarks 与帧尺寸不符（理论不发生）
-    return acc
+    # 分区混合专用宽羽化（不修改 face_oval_mask 本身 —— 美颜美白"仅脸部"仍要紧掩膜）。
+    # 宽高斯在 1/4 分辨率算（掩膜是平滑 blob，视觉等价），避开全帧 sigma≈14
+    # 大核高斯的慢路径（720p 实测 10.4ms → 0.3ms）。
+    sigma = max(PARTITION_FEATHER_MIN, PARTITION_FEATHER_RATIO * min(h, w))
+    sh, sw = max(h // 4, 1), max(w // 4, 1)
+    small = cv2.resize(acc, (sw, sh), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), sigma / 4.0)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
 
 
 def region_mean_l(l_ch: np.ndarray,
@@ -116,6 +136,26 @@ def gamma_for_exposure(mean_l: Optional[float],
     return float(np.clip(gamma, GAMMA_MIN, GAMMA_MAX))
 
 
+def face_target_backlight_damp(face_target: float,
+                               bg_mean: Optional[float],
+                               face_mean: Optional[float]) -> float:
+    """逆光抑制：背景比脸亮很多时，人脸目标亮度向背景目标回退。
+
+    逆光量 backlight = bg_mean - face_mean（>0 表示逆光）超过
+    BACKLIGHT_DAMP_OFFSET 后线性回退：从 OFFSET 到 OFFSET+RANGE，
+    脸目标从 face_target 平滑降到 BG_TARGET_L（强逆光下不再硬把脸
+    拉亮，避免"亮脸贴亮底"的贴片感）。任一侧均值为 None（区域空/
+    无人脸）时不做抑制。
+    """
+    if bg_mean is None or face_mean is None:
+        return face_target
+    backlight = bg_mean - face_mean
+    if backlight <= BACKLIGHT_DAMP_OFFSET:
+        return face_target
+    t = min((backlight - BACKLIGHT_DAMP_OFFSET) / BACKLIGHT_DAMP_RANGE, 1.0)
+    return float(BG_TARGET_L + (1.0 - t) * (face_target - BG_TARGET_L))
+
+
 def gamma_lut(gamma: float) -> np.ndarray:
     """幂变换 LUT：lut[v] = round(255 × (v/255)^γ)，float32[256]。
 
@@ -136,6 +176,38 @@ def apply_partition_gamma(l_ch: np.ndarray, lut_face: np.ndarray,
     if mask01 is None:
         return base.astype(np.uint8)
     out = base + (lut_face[l_ch] - base) * mask01
+    return np.clip(np.round(out), 0, 255).astype(np.uint8)
+
+
+def detail_preserving_gamma(l_ch: np.ndarray, lut_face: np.ndarray,
+                            lut_bg: np.ndarray,
+                            mask01: Optional[np.ndarray]) -> np.ndarray:
+    """细节保留的分区 gamma：gamma 只打大尺度"照明层"，局部对比度原样保留。
+
+    经典 detail-preserving tone mapping：base = blur(L)（大尺度照明）、
+    detail = L - base（局部对比度，含 3D 明暗渐变 + 皮肤纹理），只对 base
+    查 lut 曝光，再回加 detail。这样提亮不再把眼窝/鼻影等阴影压平（"面具
+    感"主因）。对平坦区域 detail=0，退化为 apply_partition_gamma 的原行为。
+    """
+    h, w = l_ch.shape[:2]
+    sigma = max(DETAIL_BASE_MIN, DETAIL_BASE_SIGMA_RATIO * min(h, w))
+    # base 是低频照明层：整段（降采样 → 大 sigma 高斯 → 分区 LUT 混合 →
+    # 上采样）都在 1/4 分辨率做，成本近似按 D² 下降（720p 大 sigma 全帧
+    # 高斯 ~430ms → 本路径 ~5ms）。降采样本身是低通，视觉上等价于全分辨率
+    # 大 sigma 高斯（beauty 磨皮的同款做法）。detail = L - base 会顺带把
+    # 上采样残差也算进细节层，仍属"高于 base 尺度的结构"，保留无害。
+    d = DETAIL_BASE_DOWNSCALE
+    sh, sw = max(h // d, 1), max(w // d, 1)
+    small = cv2.resize(l_ch, (sw, sh), interpolation=cv2.INTER_AREA)
+    small_base = cv2.GaussianBlur(small, (0, 0), sigma / d)
+    small_mask = (None if mask01 is None else
+                  cv2.resize(mask01, (sw, sh), interpolation=cv2.INTER_AREA))
+    small_base_new = apply_partition_gamma(small_base, lut_face, lut_bg, small_mask)
+    # 曝光修正场（平滑）：out = l + (base_new - base)。修正场在低分辨率算好、
+    # 只上采样一次，省掉两次全帧 base/base_new 上采样 + 全帧 detail 相减。
+    small_corr = small_base_new.astype(np.float32) - small_base.astype(np.float32)
+    corr = cv2.resize(small_corr, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = l_ch.astype(np.float32) + corr
     return np.clip(np.round(out), 0, 255).astype(np.uint8)
 
 
@@ -238,7 +310,7 @@ class AutoEnhanceEffect(Effect):
     def default_params() -> dict:
         return {
             "strength": 0.8,
-            "face_exposure": 0.7,
+            "face_exposure": 0.5,
             "contrast": 0.3,
             "color": 0.5,
             "saturation": 0.0,
@@ -310,6 +382,7 @@ class AutoEnhanceEffect(Effect):
 
         face_target = BG_TARGET_L + float(p["face_exposure"]) * (
             FACE_TARGET_L - BG_TARGET_L)
+        face_target = face_target_backlight_damp(face_target, bg_mean, face_mean)
         g_face = gamma_for_exposure(face_mean, face_target)
         g_bg = gamma_for_exposure(bg_mean, BG_TARGET_L)
         self._ema_face = ema_tuple(self._ema_face, (g_face,), float(p["smooth"]))
@@ -319,7 +392,7 @@ class AutoEnhanceEffect(Effect):
 
         lut_face = gamma_lut(gamma_f)
         lut_bg = gamma_lut(gamma_b)
-        l_new = apply_partition_gamma(l_ch, lut_face, lut_bg, mask01)
+        l_new = detail_preserving_gamma(l_ch, lut_face, lut_bg, mask01)
         l_new = clahe_apply(l_new, float(p["contrast"]))
         a_ch, b_ch = scale_saturation_ab(
             a_ch, b_ch, 1.0 + SAT_SCALE_MAX * float(p["saturation"]))

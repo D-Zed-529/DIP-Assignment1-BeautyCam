@@ -203,8 +203,8 @@ def main() -> int:
                     help="启用自适应画质（分区自动曝光 + CLAHE + 白平衡，全时段经典 DIP）")
     ae.add_argument("--ae-strength", type=float, default=0.8,
                     help="总强度 0~1（结果与原图混合）")
-    ae.add_argument("--ae-face-expo", type=float, default=0.7,
-                    help="人脸曝光优先 0~1（人脸目标亮度 115→150 插值；0=全图统一）")
+    ae.add_argument("--ae-face-expo", type=float, default=0.5,
+                    help="人脸曝光优先 0~1（人脸目标亮度 115→135 插值；0=全图统一）")
     ae.add_argument("--ae-contrast", type=float, default=0.3,
                     help="CLAHE 对比度 0~1（0=关）")
     ae.add_argument("--ae-color", type=float, default=0.5,

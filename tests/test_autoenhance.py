@@ -15,7 +15,8 @@ import numpy as np
 from core.context import FaceInfo, FrameContext
 from core.effects.autoenhance import (
     BG_TARGET_L, FACE_TARGET_L, AutoEnhanceEffect, apply_partition_gamma,
-    apply_wb, clahe_apply, ema_tuple, face_union_mask, gamma_for_exposure,
+    apply_wb, clahe_apply, detail_preserving_gamma, ema_tuple,
+    face_target_backlight_damp, face_union_mask, gamma_for_exposure,
     gamma_lut, gray_world_gains, region_mean_l, scale_saturation_ab,
 )
 from core.infer import FACE_OVAL_IDS
@@ -267,8 +268,12 @@ class TestEffectEndToEnd(unittest.TestCase):
                         abs(l_before - BG_TARGET_L))
 
     def test_face_exposure_priority_lifts_face_more(self):
-        """face_exposure 插值方向：0.7 比 0 对脸核心的提亮更强（目标 139.5 > 115）。"""
-        f = backlit_frame()
+        """face_exposure 插值方向：非逆光场景下 0.7 比 0 对脸核心的提亮更强。
+
+        用均匀暗帧（脸/背景同亮，逆光量≈0 不触发逆光抑制），隔离
+        face_exposure 的插值方向；逆光场景另有 test_backlight_damp 覆盖。
+        """
+        f = np.full((H, W, 3), 60, np.uint8)
         ctx = ctx_with_face()
         face_zone = face_union_mask(f, ctx.faces) > 200
 
@@ -318,6 +323,66 @@ class TestEffectEndToEnd(unittest.TestCase):
     def test_needs_faces_declared(self):
         from core.pipeline import NEED_FACES
         self.assertIn(NEED_FACES, AutoEnhanceEffect.needs)
+
+
+class TestMaskFeelImprovements(unittest.TestCase):
+    """针对"面具感"的三处改进的回归单测：宽羽化 / 细节保留 / 逆光抑制。"""
+
+    def test_union_mask_wide_feather(self):
+        """宽羽化：椭圆边缘外 ~10px 处 mask 值落在 (0,255) 中间（过渡带变宽）。
+
+        旧实现只用 face_oval_mask 的 11px 高斯（sigma≈2），10px 外几乎为 0；
+        现在并集后叠加尺度自适应宽高斯（sigma≥12），该处应有显著羽化值。
+        椭圆右边界顶点在 (0.4W, 0.5H)，10px 外即 (0.4W+10, 0.5H)。
+        """
+        f = np.zeros((H, W, 3), np.uint8)
+        m = face_union_mask(f, ctx_with_face().faces)
+        v = float(m[int(H * 0.5), int(W * 0.4) + 10])
+        self.assertGreater(v, 10.0)     # 非零 → 羽化带已扩到 10px 外
+        self.assertLess(v, 240.0)       # 非满 → 仍在过渡带内
+
+    def test_detail_preserving_keeps_local_contrast(self):
+        """细节保留：gamma 提亮只打大尺度 base，局部明暗起伏不被压平。
+
+        直接用 γ=0.5（强提亮）验证纯函数差异：同一张含高频明暗起伏的 L，
+        apply_partition_gamma 把局部对比度压到 ≈局部 LUT 斜率倍（<1），
+        detail_preserving_gamma 回加 detail 后几乎原样保留（"面具感"的修复）。
+        """
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        ripple = 20.0 * np.sin(2 * np.pi * xx / 4.0)   # 波长 4px，远小于 base sigma
+        l_ch = np.clip(128.0 + ripple, 0, 255).astype(np.uint8)
+
+        lut = gamma_lut(0.5)          # γ=0.5：强提亮，局部对比度被压
+        mask = np.ones((H, W), np.float32)
+        old_out = apply_partition_gamma(l_ch, lut, lut, mask)
+        new_out = detail_preserving_gamma(l_ch, lut, lut, mask)
+
+        def detail_std(x: np.ndarray) -> float:
+            base = cv2.GaussianBlur(x, (0, 0), 8)
+            return float((x.astype(np.float32) - base.astype(np.float32)).std())
+
+        c_before = detail_std(l_ch)
+        c_old = detail_std(old_out)
+        c_new = detail_std(new_out)
+        self.assertLess(c_old, 0.85 * c_before)     # 老路径被 gamma 明显压平
+        self.assertGreater(c_new, 0.9 * c_before)   # 新路径几乎原样保留
+        self.assertGreater(c_new, c_old)
+
+    def test_backlight_damp_retreats_face_target(self):
+        """逆光抑制：背景比脸亮很多时，脸目标回退到背景目标附近。"""
+        ft = FACE_TARGET_L
+        # 无逆光（差值 ≤30）：目标不变
+        self.assertAlmostEqual(face_target_backlight_damp(ft, 100.0, 90.0), ft)
+        # 强逆光（差值 155）：完全回退到背景目标
+        self.assertAlmostEqual(
+            face_target_backlight_damp(ft, 210.0, 55.0), BG_TARGET_L)
+        # 部分逆光（差值 60 → t=0.5）：回退到两者之间
+        mid = face_target_backlight_damp(ft, 140.0, 80.0)
+        self.assertGreater(mid, BG_TARGET_L)
+        self.assertLess(mid, ft)
+        # 区域空（None）：不做抑制
+        self.assertAlmostEqual(face_target_backlight_damp(ft, None, 80.0), ft)
+        self.assertAlmostEqual(face_target_backlight_damp(ft, 140.0, None), ft)
 
 
 if __name__ == "__main__":
